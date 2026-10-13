@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+    />
+    <title>邮件预览 · MailMaster</title>
+    <link rel="stylesheet" href="preview.css" />
+  </head>
+  <body>
+    <header class="pv-bar">
+      <div class="pv-brand">
+        <span class="pv-logo">✉</span>
+        <div class="pv-brand-text">
+          <strong>邮件预览</strong>
+          <span id="pv-subtitle">正在接收内容…</span>
+        </div>
+      </div>
+
+      <div class="pv-tools">
+        <label class="pv-field" title="正文显示宽度（模拟不同邮箱客户端的阅读区宽度）">
+          <span>宽度</span>
+          <select id="pv-width">
+            <option value="600">窄 600px</option>
+            <option value="720" selected>标准 720px</option>
+            <option value="900">宽 900px</option>
+            <option value="0">自适应</option>
+          </select>
+        </label>
+
+        <label class="pv-field" title="正文字号">
+          <span>字号</span>
+          <select id="pv-font">
+            <option value="13">小</option>
+            <option value="15" selected>中</option>
+            <option value="17">大</option>
+          </select>
+        </label>
+
+        <button class="pv-btn" id="pv-print" title="打印或另存为 PDF">打印 / PDF</button>
+        <button class="pv-btn pv-btn-close" id="pv-close" title="关闭预览窗口">关闭</button>
+      </div>
+    </header>
+
+    <main class="pv-scroll">
+      <div class="pv-stage" id="pv-stage">
+        <div class="pv-empty">
+          <strong>正在接收邮件内容…</strong>
+          若长时间没有内容，请回到主窗口重新点击「独立窗口预览」。
+        </div>
+      </div>
+    </main>
+
+    <script src="js/preview-window.js"></script>
+  </body>
+</html>

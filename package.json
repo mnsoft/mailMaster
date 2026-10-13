@@ -1,0 +1,67 @@
+{
+  "name": "mailmaster",
+  "productName": "MailMaster",
+  "version": "1.0.1",
+  "description": "邮件定时推广助手 - 面向 Windows 10 的批量推广邮件定时发送与投递跟踪工具",
+  "main": "src/main/main.js",
+  "author": "MailMaster",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "preview": "node tools/preview-server.js",
+    "test": "node test/run-tests.js",
+    "build:win": "electron-builder --win --x64",
+    "build:win-portable": "electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.16"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.mailmaster.desktop",
+    "productName": "MailMaster",
+    "artifactName": "MailMaster-${version}-${arch}-setup.${ext}",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "MailMaster 邮件推广助手",
+      "language": "2052"
+    },
+    "portable": {
+      "artifactName": "MailMaster-${version}-portable.${ext}"
+    }
+  }
+}

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+    />
+    <title>MailMaster · 邮件定时推广助手</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-logo">M</div>
+          <div class="brand-text">
+            <strong>MailMaster</strong>
+            <span>邮件定时推广助手</span>
+          </div>
+        </div>
+
+        <nav class="nav" id="nav">
+          <a class="nav-item" data-route="dashboard"><i>◎</i><span>总览看板</span></a>
+          <a class="nav-item" data-route="contacts"><i>▤</i><span>推广邮件列表</span></a>
+          <a class="nav-item" data-route="accounts"><i>✉</i><span>发信邮箱配置</span></a>
+          <a class="nav-item" data-route="templates"><i>✎</i><span>内容模板</span></a>
+          <a class="nav-item" data-route="campaigns"><i>➤</i><span>推广任务</span></a>
+          <a class="nav-item" data-route="tasks"><i>⏱</i><span>定时任务管理</span></a>
+          <a class="nav-item" data-route="delivery"><i>✓</i><span>投递状态</span></a>
+          <a class="nav-item" data-route="settings"><i>⚙</i><span>系统设置</span></a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="mode-chip" id="mode-chip">
+            <span class="dot"></span><span class="mode-text">加载中…</span>
+          </div>
+          <div class="ver" id="app-ver"></div>
+        </div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <div class="page-title" id="page-title">总览看板</div>
+          <div class="topbar-right">
+            <div class="countdown" id="countdown" title="距离下一次定时推广启动的倒计时">
+              <span class="cd-label">下次推广</span>
+              <span class="cd-value" id="cd-value">--:--:--</span>
+              <span class="cd-name" id="cd-name"></span>
+            </div>
+            <div class="window-controls">
+              <button class="wc-btn" id="wc-min" title="最小化">—</button>
+              <button class="wc-btn" id="wc-max" title="最大化">▢</button>
+              <button class="wc-btn wc-close" id="wc-close" title="关闭">✕</button>
+            </div>
+          </div>
+        </header>
+        <section class="view" id="view"></section>
+      </main>
+    </div>
+
+    <div id="modal-layer"></div>
+    <div id="toast-layer" class="toast-layer"></div>
+
+    <!-- dev-mock 必须在 core.js 之前加载：浏览器预览时它会先注入 window.api，
+         Electron 环境下会因 window.api 已存在而直接跳过 -->
+    <script src="js/dev-mock.js"></script>
+    <script src="js/core.js"></script>
+    <script src="js/pages/dashboard.js"></script>
+    <script src="js/pages/contacts.js"></script>
+    <script src="js/pages/accounts.js"></script>
+    <script src="js/pages/templates.js"></script>
+    <script src="js/pages/campaigns.js"></script>
+    <script src="js/pages/tasks.js"></script>
+    <script src="js/pages/delivery.js"></script>
+    <script src="js/pages/settings.js"></script>
+    <script src="js/app.js"></script>
+  </body>
+</html>
