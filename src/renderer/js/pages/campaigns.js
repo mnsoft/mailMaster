@@ -20,6 +20,25 @@
     { value: 'once', label: '指定时间一次' },
   ];
 
+  /** 节奏预设与账号池策略（首次使用时从主进程读取并缓存） */
+  let PACING_META = {
+    presets: [],
+    strategies: [
+      { key: 'roundRobin', label: '轮询（推荐）', hint: '按顺序依次使用每个账号，用量最均衡' },
+      { key: 'random', label: '随机', hint: '每封在可用账号中随机挑选，分布更不规律' },
+    ],
+  };
+  let pacingMetaLoaded = false;
+  async function ensurePacingMeta() {
+    if (pacingMetaLoaded) return PACING_META;
+    const res = await MM.api.pacingMeta();
+    if (res.ok && res.data) {
+      PACING_META = { presets: res.data.presets || [], strategies: res.data.strategies || PACING_META.strategies };
+      pacingMetaLoaded = true;
+    }
+    return PACING_META;
+  }
+
   function scheduleFormHtml(schedule) {
     const s = schedule || { type: 'manual' };
     return `
@@ -107,10 +126,18 @@
   function campaignFormHtml(campaign) {
     const c = campaign || {};
     const tplId = c.templateId || (MM.state.templates[0] && MM.state.templates[0].id);
-    const throttle = Object.assign({ intervalSeconds: 6, dailyLimit: 200, maxRetries: 1 }, c.throttle || {});
+    // 节奏：任务自身配置优先，其次取系统设置里的默认节奏（兼容旧任务的 intervalSeconds 写法）
+    const defaults = (MM.state.settings && MM.state.settings.defaultThrottle) || {};
+    const throttle = Object.assign(
+      { mode: 'fixed', intervalSeconds: 10, delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 0, burstMinSeconds: 180, burstMaxSeconds: 420, hourlyLimit: 0, dailyLimit: 200, maxRetries: 1 },
+      defaults,
+      c.throttle || {},
+    );
     const accounts = MM.state.accounts || [];
     const defaultAccount = accounts.find((a) => a.isDefault) || accounts.find((a) => a.enabled !== false) || accounts[0];
     const accId = c.accountId || (defaultAccount && defaultAccount.id) || '';
+    const poolIds = Array.isArray(c.accountIds) ? c.accountIds.slice() : [];
+    const accMode = c.accountMode === 'pool' || poolIds.length > 1 ? 'pool' : 'single';
     return `
       <div class="form-grid">
         <div class="field span-2">
@@ -133,15 +160,40 @@
           <label class="field-label">发信邮箱账号<span class="req">*</span> <span class="field-hint">（不同任务可使用不同的发信地址）</span></label>
           ${
             accounts.length
-              ? `<select class="select" data-role="accountId">
-                   ${accounts
-                     .map(
-                       (a) =>
-                         `<option value="${a.id}" ${a.id === accId ? 'selected' : ''} ${a.enabled === false ? 'disabled' : ''}>${MM.esc(a.email)}　·　${MM.esc(a.name)}${a.isDefault ? '（默认）' : ''}${a.enabled === false ? '（已停用）' : ''}</option>`,
-                     )
-                     .join('')}
-                 </select>
-                 <div class="field-hint">该任务的邮件将从所选邮箱发出，模板中的 <span class="mono">{{发件人}}</span> 取该账号的发信人姓名。</div>`
+              ? `<div class="segmented" data-role="acc-modes">
+                   <button data-mode="single" class="${accMode === 'single' ? 'active' : ''}">单个账号</button>
+                   <button data-mode="pool" class="${accMode === 'pool' ? 'active' : ''}">多账号轮询发送</button>
+                 </div>
+                 <div data-role="acc-single" class="${accMode === 'single' ? '' : 'hidden'}" style="margin-top:10px">
+                   <select class="select" data-role="accountId">
+                     ${accounts
+                       .map(
+                         (a) =>
+                           `<option value="${a.id}" ${a.id === accId ? 'selected' : ''} ${a.enabled === false ? 'disabled' : ''}>${MM.esc(a.email)}　·　${MM.esc(a.name)}${a.isDefault ? '（默认）' : ''}${a.enabled === false ? '（已停用）' : ''}</option>`,
+                       )
+                       .join('')}
+                   </select>
+                   <div class="field-hint">该任务的全部邮件都从所选邮箱发出，模板中的 <span class="mono">{{发件人}}</span> 取该账号的发信人姓名。</div>
+                 </div>
+                 <div data-role="acc-pool" class="${accMode === 'pool' ? '' : 'hidden'}" style="margin-top:10px">
+                   <div class="field-label" style="margin-bottom:6px">参与轮询的账号（至少勾选 2 个）</div>
+                   <div class="checkbox-list">
+                     ${accounts
+                       .map(
+                         (a) => `<label><input type="checkbox" data-pool-acc value="${a.id}" ${poolIds.includes(a.id) ? 'checked' : ''} ${a.enabled === false ? 'disabled' : ''} /> ${MM.esc(a.email)}　·　${MM.esc(a.name)}${a.enabled === false ? '（已停用，不会参与）' : ''}${a.dailyLimit ? `　日限 ${a.dailyLimit}` : ''}</label>`,
+                       )
+                       .join('')}
+                   </div>
+                   <div class="form-grid" style="margin-top:10px">
+                     <div class="field"><label class="field-label">轮询策略</label>
+                       <select class="select" data-role="accountStrategy">
+                         ${(PACING_META.strategies || []).map((s) => `<option value="${s.key}" ${(c.accountStrategy || 'roundRobin') === s.key ? 'selected' : ''}>${MM.esc(s.label)} — ${MM.esc(s.hint)}</option>`).join('')}
+                       </select>
+                       <div class="field-hint">轮询让所有邮件不再从同一个邮箱发出，单账号频率更低、更接近正常使用；达到日限额的账号会被自动跳过。</div>
+                     </div>
+                   </div>
+                   <div class="field-hint">多账号共用同一份邮件模板；每封邮件的 <span class="mono">{{发件人}}</span> 会自动取当封实际使用的账号。</div>
+                 </div>`
               : `<div class="callout warn" style="margin:0">尚未配置发信邮箱账号，请先前往「发信邮箱配置」添加。</div>`
           }
         </div>
@@ -154,19 +206,71 @@
         </div>
       </div>
 
-      <div class="panel"><div class="panel-head"><div class="panel-title">② 发送节流与重试</div></div>
+      <div class="panel"><div class="panel-head">
+        <div class="panel-title">② 发送节奏（随机延迟 · 速率控制）</div>
+        <span class="hint">逐封之间加入延迟，模拟人工发送痕迹</span>
+      </div>
         <div class="panel-body">
+          <div class="field">
+            <label class="field-label">一键套用节奏预设</label>
+            <div class="var-picker" data-role="pace-presets">
+              ${(PACING_META.presets || [])
+                .map((p) => `<button class="var-chip" data-preset="${p.key}" title="${MM.attr(p.hint)}">${MM.esc(p.label)}</button>`)
+                .join('')}
+            </div>
+            <div class="field-hint">每封之间的等待时间在设定区间内<b>随机取值</b>，避免出现「等间隔」这种机器特征；长停顿与每小时上限可进一步压低短时间内的发送密度，降低触发垃圾邮件频率阈值与限流封号的风险。</div>
+          </div>
+
+          <div class="field" style="margin-bottom:10px">
+            <label class="field-label">间隔模式</label>
+            <div class="segmented" data-role="pace-mode">
+              <button data-mode="fixed" class="${throttle.mode === 'random' ? '' : 'active'}">固定间隔（可预期）</button>
+              <button data-mode="random" class="${throttle.mode === 'random' ? 'active' : ''}">随机延迟（拟人，推荐）</button>
+            </div>
+          </div>
+
           <div class="form-grid c3">
-            <div class="field"><label class="field-label">每封间隔（秒）</label>
+            <div class="field ${throttle.mode === 'random' ? 'hidden' : ''}" data-role="pace-fixed">
+              <label class="field-label">每封间隔（秒）</label>
               <input class="input" type="number" min="0" data-role="intervalSeconds" value="${MM.attr(throttle.intervalSeconds)}" />
-              <div class="field-hint">建议 5～15 秒，过快易被判为垃圾邮件</div></div>
+              <div class="field-hint">建议 5～15 秒，过快易被判为垃圾邮件</div>
+            </div>
+            <div class="field ${throttle.mode === 'random' ? '' : 'hidden'}" data-role="pace-random-min">
+              <label class="field-label">随机最小延迟（秒）</label>
+              <input class="input" type="number" min="0" data-role="delayMinSeconds" value="${MM.attr(throttle.delayMinSeconds)}" />
+              <div class="field-hint">每封之间至少等待这么久</div>
+            </div>
+            <div class="field ${throttle.mode === 'random' ? '' : 'hidden'}" data-role="pace-random-max">
+              <label class="field-label">随机最大延迟（秒）</label>
+              <input class="input" type="number" min="0" data-role="delayMaxSeconds" value="${MM.attr(throttle.delayMaxSeconds)}" />
+              <div class="field-hint">每封之间最多等待这么久</div>
+            </div>
+          </div>
+
+          <div class="form-grid c3" style="margin-top:6px">
+            <div class="field"><label class="field-label">每发送多少封后长停顿（0 = 不启用）</label>
+              <input class="input" type="number" min="0" data-role="burstEvery" value="${MM.attr(throttle.burstEvery)}" />
+              <div class="field-hint">例：每 10 封后休息一段时间，模拟人工离开</div></div>
+            <div class="field"><label class="field-label">长停顿最短（秒）</label>
+              <input class="input" type="number" min="0" data-role="burstMinSeconds" value="${MM.attr(throttle.burstMinSeconds)}" /></div>
+            <div class="field"><label class="field-label">长停顿最长（秒）</label>
+              <input class="input" type="number" min="0" data-role="burstMaxSeconds" value="${MM.attr(throttle.burstMaxSeconds)}" /></div>
+          </div>
+
+          <div class="form-grid c3" style="margin-top:6px">
+            <div class="field"><label class="field-label">每小时发送上限（0 = 不限）</label>
+              <input class="input" type="number" min="0" data-role="hourlyLimit" value="${MM.attr(throttle.hourlyLimit)}" />
+              <div class="field-hint">超过后自动等待到下一个小时窗口继续</div></div>
             <div class="field"><label class="field-label">每日发送上限（0 = 不限）</label>
               <input class="input" type="number" min="0" data-role="dailyLimit" value="${MM.attr(throttle.dailyLimit)}" /></div>
             <div class="field"><label class="field-label">失败重试次数</label>
               <input class="input" type="number" min="0" max="5" data-role="maxRetries" value="${MM.attr(throttle.maxRetries)}" />
               <div class="field-hint">仅对临时性失败（如超时）重试</div></div>
           </div>
-          <label class="switch" style="margin-top:6px"><input type="checkbox" data-role="dryRun" ${c.dryRun !== false ? 'checked' : ''} /><span class="track"></span>本次任务使用「试运行」（模拟发送并记录结果，不真正发出邮件）</label>
+
+          <div class="stat-inline" data-role="pace-estimate">正在估算本批耗时…</div>
+
+          <label class="switch" style="margin-top:12px"><input type="checkbox" data-role="dryRun" ${c.dryRun !== false ? 'checked' : ''} /><span class="track"></span>本次任务使用「试运行」（模拟发送并记录结果，不真正发出邮件）</label>
         </div>
       </div>`;
   }
@@ -198,11 +302,15 @@
         <div style="color:var(--text-dim);font-size:12px;margin-bottom:10px">${MM.esc(c.description || '（无说明）')}</div>
         <div class="pill-row" style="margin-bottom:10px">
           <span class="pill">模板 <b>${MM.esc((MM.state.templates.find((t) => t.id === c.templateId) || {}).name || '未关联')}</b></span>
-          <span class="pill">发信邮箱 <b>${MM.esc(c.accountEmail || '未指定')}</b></span>
+          ${
+            c.poolEmails && c.poolEmails.length
+              ? `<span class="pill" title="${MM.attr(c.poolEmails.join('\\n'))}">账号池 <b>${c.poolEmails.length} 个</b> <span style="color:var(--text-faint)">${MM.esc(c.poolEmails.slice(0, 2).join('、'))}${c.poolEmails.length > 2 ? '…' : ''}</span></span>
+                 <span class="pill">策略 <b>${MM.esc(c.accountStrategy === 'random' ? '随机' : '轮询')}</b></span>`
+              : `<span class="pill">发信邮箱 <b>${MM.esc(c.accountEmail || '未指定')}</b></span>`
+          }
           <span class="pill">执行计划 <b>${MM.esc(c.scheduleText || '—')}</b></span>
           ${c.nextRunAt ? `<span class="pill">下次执行 <b>${MM.esc(MM.fmtDate(c.nextRunAt, true))}</b></span>` : ''}
-          <span class="pill">间隔 <b>${c.throttle?.intervalSeconds ?? '—'} 秒</b></span>
-          <span class="pill">每日上限 <b>${c.throttle?.dailyLimit ?? '—'}</b></span>
+          <span class="pill">节奏 <b>${MM.esc(c.paceText || '—')}</b></span>
           <span class="pill">运行次数 <b>${c.runCount || 0}</b></span>
         </div>
         ${
@@ -225,7 +333,7 @@
     title: '推广任务',
 
     async render(view) {
-      await Promise.all([MM.loadTemplates(), MM.loadCampaigns(), MM.loadAccounts()]);
+      await Promise.all([MM.loadTemplates(), MM.loadCampaigns(), MM.loadAccounts(), MM.loadSettings(), ensurePacingMeta()]);
       const res = await MM.api.listContacts({ status: 'active' });
       state.contacts = res.ok ? res.data.items : [];
       state.tags = res.ok ? res.data.tags : [];
@@ -284,12 +392,27 @@
 
             if (act === 'run') {
               const effectiveDry = MM.effectiveDryRun(campaign);
+              // 实时取一次命中人数，用于在确认框里给出真实耗时预期（并说明被剔除的退信地址）
+              const audRes = await MM.api.previewCampaignAudience(campaign.audience || { mode: 'all' });
+              const audTotal = audRes.ok ? audRes.data.total : 0;
+              const exc = (audRes.ok && audRes.data.exclusions) || null;
+              const estRes = await MM.api.paceEstimate({ throttle: campaign.throttle || {}, total: audTotal });
+              const estText = estRes.ok ? estRes.data.text : '—';
+              const senderText =
+                campaign.poolEmails && campaign.poolEmails.length
+                  ? `多账号轮询（${campaign.poolEmails.length} 个）：${MM.esc(campaign.poolEmails.join('、'))}`
+                  : MM.esc(campaign.accountEmail || '（默认发信账号）');
               const yes = await MM.confirm({
                 title: '确认执行推广任务',
                 message: `即将向「<b>${MM.esc(campaign.name)}</b>」配置的范围内所有可发送联系人投递邮件。<br/>
-                  发信邮箱：<b>${MM.esc(campaign.accountEmail || '（默认发信账号）')}</b><br/>
-                  发送模式：<b style="color:${effectiveDry ? 'var(--warn)' : 'var(--danger)'}">${effectiveDry ? '试运行（不会真正发出）' : '真实发送（会真实投递）'}</b><br/>
-                  每封间隔 ${campaign.throttle?.intervalSeconds ?? 6} 秒，每日上限 ${campaign.throttle?.dailyLimit ?? '不限'} 封。`,
+                  发信账号：<b>${senderText}</b><br/>
+                  命中收件人：<b>${audTotal}</b> 位${
+                    exc && exc.bounceMarked
+                      ? `（已自动剔除 <b style="color:var(--warn)">${exc.bounceMarked}</b> 个退信标记地址${exc.unsubscribed ? `、${exc.unsubscribed} 个已停用地址` : ''}）`
+                      : ''
+                  }<br/>
+                  发送节奏：<b>${MM.esc(campaign.paceText || estRes.data.describe || '—')}</b>，预计整批耗时 <b>${MM.esc(estText)}</b><br/>
+                  发送模式：<b style="color:${effectiveDry ? 'var(--warn)' : 'var(--danger)'}">${effectiveDry ? '试运行（不会真正发出）' : '真实发送（会真实投递）'}</b>`,
                 confirmText: effectiveDry ? '开始试运行' : '确认真实发送',
                 danger: !effectiveDry,
               });
@@ -484,6 +607,124 @@
       return schedule;
     };
 
+    // ----- 发信账号：单账号 / 多账号轮询 -----
+    let accMode = (ctx.$('[data-role="acc-modes"] button.active') || { dataset: {} }).dataset.mode || 'single';
+    const accSingleBox = ctx.$('[data-role="acc-single"]');
+    const accPoolBox = ctx.$('[data-role="acc-pool"]');
+    const paintAccMode = () => {
+      ctx.$$('[data-role="acc-modes"] button').forEach((b) => b.classList.toggle('active', b.dataset.mode === accMode));
+      if (accSingleBox) accSingleBox.classList.toggle('hidden', accMode !== 'single');
+      if (accPoolBox) accPoolBox.classList.toggle('hidden', accMode !== 'pool');
+    };
+    ctx.$$('[data-role="acc-modes"] button').forEach((btn) => {
+      btn.onclick = () => {
+        accMode = btn.dataset.mode;
+        paintAccMode();
+      };
+    });
+    paintAccMode();
+
+    const collectAccounts = () => {
+      if (accMode === 'pool' && accPoolBox) {
+        const ids = ctx.$$('[data-pool-acc]').filter((el) => el.checked && !el.disabled).map((el) => el.value);
+        const strategyEl = ctx.$('[data-role="accountStrategy"]');
+        return {
+          accountMode: 'pool',
+          accountIds: ids,
+          accountStrategy: strategyEl ? strategyEl.value : 'roundRobin',
+          // 保留一个主账号，便于单账号模式的账号池回落与历史记录展示
+          accountId: ids[0] || undefined,
+        };
+      }
+      const singleEl = ctx.$('[data-role="accountId"]');
+      return {
+        accountMode: 'single',
+        accountIds: [],
+        accountStrategy: 'roundRobin',
+        accountId: singleEl ? singleEl.value : undefined,
+      };
+    };
+
+    // ----- 发送节奏（随机延迟）-----
+    let paceMode = (ctx.$('[data-role="pace-mode"] button.active') || { dataset: {} }).dataset.mode || 'fixed';
+    const paceFixedBox = ctx.$('[data-role="pace-fixed"]');
+    const paceRandomMinBox = ctx.$('[data-role="pace-random-min"]');
+    const paceRandomMaxBox = ctx.$('[data-role="pace-random-max"]');
+    let estimateTotal = 0;
+
+    const collectPace = () => ({
+      mode: paceMode,
+      intervalSeconds: Number(ctx.$('[data-role="intervalSeconds"]').value) || 0,
+      delayMinSeconds: Number(ctx.$('[data-role="delayMinSeconds"]').value) || 0,
+      delayMaxSeconds: Number(ctx.$('[data-role="delayMaxSeconds"]').value) || 0,
+      burstEvery: Number(ctx.$('[data-role="burstEvery"]').value) || 0,
+      burstMinSeconds: Number(ctx.$('[data-role="burstMinSeconds"]').value) || 0,
+      burstMaxSeconds: Number(ctx.$('[data-role="burstMaxSeconds"]').value) || 0,
+      hourlyLimit: Number(ctx.$('[data-role="hourlyLimit"]').value) || 0,
+      dailyLimit: Number(ctx.$('[data-role="dailyLimit"]').value) || 0,
+      maxRetries: Number(ctx.$('[data-role="maxRetries"]').value) || 0,
+    });
+
+    /** 按当前节奏 + 命中人数估算整批耗时 */
+    const refreshPaceEstimate = async () => {
+      const box = ctx.$('[data-role="pace-estimate"]');
+      if (!box || !box.isConnected) return;
+      const res = await MM.api.paceEstimate({ throttle: collectPace(), total: estimateTotal });
+      if (!res.ok || !box.isConnected) return;
+      const d = res.data;
+      const veryLong = d.ms > 12 * 3600 * 1000;
+      box.className = `stat-inline ${veryLong ? 'warn' : 'ok'}`;
+      box.innerHTML = estimateTotal
+        ? `共 <b>${MM.fmtNumber(estimateTotal)}</b> 位收件人 · 按当前节奏预计整批耗时 <b>${MM.esc(d.text)}</b><br/><span style="color:var(--text-faint)">实际节奏：${MM.esc(d.describe)}</span>`
+        : `当前节奏：<b>${MM.esc(d.describe)}</b> <span style="color:var(--text-faint)">（先在「收件人范围」中点击「统计命中人数」，即可估算整批耗时）</span>`;
+    };
+
+    const paintPaceMode = () => {
+      ctx.$$('[data-role="pace-mode"] button').forEach((b) => b.classList.toggle('active', b.dataset.mode === paceMode));
+      if (paceFixedBox) paceFixedBox.classList.toggle('hidden', paceMode !== 'fixed');
+      if (paceRandomMinBox) paceRandomMinBox.classList.toggle('hidden', paceMode !== 'random');
+      if (paceRandomMaxBox) paceRandomMaxBox.classList.toggle('hidden', paceMode !== 'random');
+    };
+
+    /** 套用节奏预设 */
+    const applyPace = (cfg) => {
+      paceMode = cfg.mode === 'random' ? 'random' : 'fixed';
+      paintPaceMode();
+      Object.keys(cfg).forEach((key) => {
+        const el = ctx.$(`[data-role="${key}"]`);
+        if (el) el.value = cfg[key];
+      });
+      refreshPaceEstimate();
+    };
+
+    ctx.$$('[data-role="pace-mode"] button').forEach((btn) => {
+      btn.onclick = () => {
+        paceMode = btn.dataset.mode;
+        paintPaceMode();
+        refreshPaceEstimate();
+      };
+    });
+    ctx.$$('[data-role="pace-presets"] [data-preset]').forEach((btn) => {
+      btn.onclick = () => {
+        const preset = (PACING_META.presets || []).find((p) => p.key === btn.dataset.preset);
+        if (!preset) return;
+        applyPace(preset.config);
+        MM.toast(`已套用节奏预设「${preset.label}」`, 'success');
+      };
+    });
+    ['intervalSeconds', 'delayMinSeconds', 'delayMaxSeconds', 'burstEvery', 'burstMinSeconds', 'burstMaxSeconds', 'hourlyLimit', 'dailyLimit', 'maxRetries'].forEach((key) => {
+      const el = ctx.$(`[data-role="${key}"]`);
+      if (el) el.addEventListener('input', () => refreshPaceEstimate());
+    });
+    paintPaceMode();
+    // 打开时先按当前受众估算一次（收件人数会随后由「统计命中人数」刷新）
+    MM.api.previewCampaignAudience(audience).then((r) => {
+      if (r.ok) {
+        estimateTotal = r.data.total;
+        refreshPaceEstimate();
+      }
+    });
+
     const runAudiencePreview = async (e) => {
       collectAudience();
       const restore = MM.spinBtn(e.target, '统计中');
@@ -495,6 +736,9 @@
       }
       const d = res.data;
       ctx.$('[data-role="aud-result"]').innerHTML = `命中 <b>${d.total}</b> 位收件人`;
+      // 命中人数变化直接影响整批耗时估算
+      estimateTotal = d.total;
+      refreshPaceEstimate();
       if (d.total) {
         MM.modal({
           title: `命中收件人预览（共 ${d.total} 位，显示前 30 位）`,
@@ -521,23 +765,31 @@
       }
       collectAudience();
       collectSchedule();
-      const payload = {
-        id: campaign ? campaign.id : undefined,
-        name,
-        description: ctx.$('[data-role="description"]').value,
-        templateId: ctx.$('[data-role="templateId"]').value,
-        accountId: ctx.$('[data-role="accountId"]') ? ctx.$('[data-role="accountId"]').value : undefined,
-        kind,
-        schedule,
-        audience,
-        throttle: {
-          intervalSeconds: Number(ctx.$('[data-role="intervalSeconds"]').value) || 6,
-          dailyLimit: Number(ctx.$('[data-role="dailyLimit"]').value) || 0,
-          maxRetries: Number(ctx.$('[data-role="maxRetries"]').value) || 0,
+      const accPayload = collectAccounts();
+      if (accPayload.accountMode === 'pool' && accPayload.accountIds.length < 2) {
+        MM.toast('多账号轮询至少需要勾选 2 个发信账号（已停用的账号不会参与轮询）', 'warn', 6500);
+        return;
+      }
+      const pace = collectPace();
+      if (pace.mode === 'random' && pace.delayMaxSeconds < pace.delayMinSeconds) {
+        MM.toast('随机延迟的最大值不能小于最小值', 'warn');
+        return;
+      }
+      const payload = Object.assign(
+        {
+          id: campaign ? campaign.id : undefined,
+          name,
+          description: ctx.$('[data-role="description"]').value,
+          templateId: ctx.$('[data-role="templateId"]').value,
+          kind,
+          schedule,
+          audience,
+          throttle: pace,
+          dryRun: ctx.$('[data-role="dryRun"]').checked,
+          status: campaign ? campaign.status : 'active',
         },
-        dryRun: ctx.$('[data-role="dryRun"]').checked,
-        status: campaign ? campaign.status : kind === 'manual' ? 'active' : 'active',
-      };
+        accPayload,
+      );
       const restore = MM.spinBtn(e.target, '保存中');
       const res = await MM.api.saveCampaign(payload);
       restore();

@@ -1,7 +1,7 @@
 {
   "name": "mailmaster",
   "productName": "MailMaster",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "邮件定时推广助手 - 面向 Windows 10 的批量推广邮件定时发送与投递跟踪工具",
   "main": "src/main/main.js",
   "author": "MailMaster",
@@ -11,6 +11,7 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "preview": "node tools/preview-server.js",
+    "smoke": "electron tools/smoke-ui.js",
     "test": "node test/run-tests.js",
     "build:win": "electron-builder --win --x64",
     "build:win-portable": "electron-builder --win portable --x64"

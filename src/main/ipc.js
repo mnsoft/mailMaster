@@ -7,8 +7,10 @@
 const fs = require('fs');
 const path = require('path');
 const { ipcMain, dialog, shell, app } = require('electron');
-const { CONTACT_FIELDS, GLOBAL_FIELDS, listVariables, renderMessage, buildGlobalContext } = require('./template');
+const { CONTACT_FIELDS, GLOBAL_FIELDS, listVariables, renderMessage, buildGlobalContext, describeSpintax } = require('./template');
 const { describeSchedule, formatDateTime, scheduleNextRun } = require('./scheduler');
+const { PRESETS: PACING_PRESETS, normalize: normalizePacing, describe: describePacing, estimateMs: estimatePacing, humanizeMs } = require('./pacing');
+const { STRATEGIES: ACCOUNT_STRATEGIES } = require('./account-pool');
 const mailer = require('./mailer');
 const tencentSes = require('./tencent-ses');
 
@@ -21,10 +23,11 @@ function fail(err) {
 }
 
 class IpcBridge {
-  constructor({ db, runner, scheduler, getWindow }) {
+  constructor({ db, runner, scheduler, bounceWatcher, getWindow }) {
     this.db = db;
     this.runner = runner;
     this.scheduler = scheduler;
+    this.bounceWatcher = bounceWatcher;
     this.getWindow = getWindow;
   }
 
@@ -119,8 +122,13 @@ class IpcBridge {
     // ---------------- 设置 ----------------
     this.handle('settings:get', () => this.db.getSettings());
     this.handle('settings:save', (payload) => {
+      const before = this.db.getSettings();
       const settings = this.db.updateSettings(payload || {});
       this.scheduler.recalcAll();
+      // 退信监听的轮询间隔 / 开关变化后要重排定时器
+      const imapChanged =
+        before.imapPollMinutes !== settings.imapPollMinutes || before.imapAutoCheck !== settings.imapAutoCheck;
+      if (imapChanged && this.bounceWatcher) this.bounceWatcher.restart();
       return settings;
     });
     this.handle('settings:testSmtp', (payload) => {
@@ -159,6 +167,14 @@ class IpcBridge {
     this.handle('contacts:save', (payload) => this.db.saveContact(payload));
     this.handle('contacts:remove', (payload) => ({ removed: this.db.removeContacts(payload.ids || []) }));
     this.handle('contacts:markBounced', (payload) => this.db.markContactBounced(payload.id, payload.note));
+
+    /** 手动解除退信标记：该地址重新进入发送列表 */
+    this.handle('contacts:releaseBounce', (payload) => {
+      const contact = this.db.releaseContactBounce(payload.id, { restoreSubscription: payload.restoreSubscription !== false });
+      this.push({ type: 'bounce-state', state: this.bounceWatcher ? this.bounceWatcher.state() : null });
+      this.push({ type: 'overview-dirty' });
+      return contact;
+    });
     this.handle('contacts:exportCsv', async (payload) => {
       const csv = this.db.exportContactsCsv(payload || {});
       const result = await dialog.showSaveDialog(this.getWindow(), {
@@ -195,6 +211,27 @@ class IpcBridge {
     });
     this.handle('templates:fields', () => ({ contact: CONTACT_FIELDS, global: GLOBAL_FIELDS }));
     this.handle('templates:scan', (payload) => listVariables(`${payload.subject || ''}\n${payload.body || ''}`));
+
+    /** Spintax 概览：可产生多少种不同内容、各选项组内容 */
+    this.handle('templates:spintax', (payload) => {
+      const tpl = { subject: payload.subject || '', body: payload.body || '' };
+      const info = describeSpintax(tpl);
+      // 抽样展示几个真实变体，让用户直观看到「每封都不一样」的效果
+      const samples = [];
+      const rand = Math.random;
+      for (let i = 0; i < 5; i += 1) {
+        const rendered = renderMessage(tpl, { company: '示例公司', contact: '张三', salutation: '张总', city: '深圳' }, buildGlobalContext({ index: i + 1, total: 5 }), {
+          spintax: { rng: rand },
+        });
+        samples.push({ subject: rendered.subject, body: rendered.body.slice(0, 120) });
+      }
+      return {
+        ...info,
+        samples,
+        sampleCount: samples.length,
+        sampleUniqueSubjects: new Set(samples.map((s) => s.subject)).size,
+      };
+    });
     this.handle('templates:preview', (payload) => {
       const contact =
         this.db.getContact(payload.contactId) ||
@@ -211,19 +248,33 @@ class IpcBridge {
           index: 1,
           total: 1,
         }),
+        // spinIndex 由界面指定（「换一组措辞」按钮），不传则随机取一组
+        Number.isFinite(payload.spinIndex) ? { spintax: { index: Number(payload.spinIndex) } } : undefined,
       );
-      return { contact, rendered, account };
+      return { contact, rendered, account, spintax: describeSpintax({ subject: payload.subject, body: payload.body }) };
     });
 
     // ---------------- 推广任务 ----------------
+    /** 发送节奏与账号池的元信息（预设、策略） */
+    this.handle('pacing:meta', () => ({
+      presets: PACING_PRESETS,
+      strategies: ACCOUNT_STRATEGIES,
+    }));
+
     this.handle('campaigns:list', () => {
       const settings = this.db.getSettings();
+      const accounts = this.db.listAccounts();
       return this.db.listCampaigns().map((c) => {
         const account = this.db.resolveSendingAccount(c.accountId);
+        const poolAccounts =
+          c.accountMode === 'pool' ? (c.accountIds || []).map((id) => accounts.find((a) => a.id === id)).filter(Boolean) : [];
+        const pace = normalizePacing(c.throttle && Object.keys(c.throttle).length ? c.throttle : settings.defaultThrottle || {});
         return {
           ...c,
           accountEmail: account ? account.email : '',
           accountName: account ? account.name : '',
+          poolEmails: poolAccounts.map((a) => a.email),
+          paceText: describePacing(pace),
           scheduleText: describeSchedule(c.schedule),
           nextRunText: formatDateTime(c.nextRunAt),
           effectiveDryRun: settings.sendMode !== 'live' || c.dryRun !== false,
@@ -242,8 +293,10 @@ class IpcBridge {
     });
     this.handle('campaigns:preview', (payload) => {
       const contacts = this.db.resolveAudience(payload.audience || { mode: 'all' });
+      const exclusions = this.db.audienceExclusions();
       return {
         total: contacts.length,
+        exclusions,
         sample: contacts.slice(0, 30).map((c) => ({
           id: c.id,
           company: c.company,
@@ -253,6 +306,14 @@ class IpcBridge {
           phone: c.phone,
         })),
       };
+    });
+
+    /** 按当前节奏估算整批耗时（编辑任务时实时提示） */
+    this.handle('campaigns:paceEstimate', (payload) => {
+      const pace = normalizePacing(payload.throttle || {});
+      const total = Number(payload.total) || 0;
+      const ms = estimatePacing(pace, total);
+      return { pace, total, ms, text: humanizeMs(ms), describe: describePacing(pace) };
     });
     this.handle('campaigns:run', async (payload) => {
       const campaign = this.db.getCampaign(payload.id);
@@ -381,6 +442,39 @@ class IpcBridge {
       this.push({ type: 'log', log: this.db.getLog(newLog.id) });
       this.push({ type: 'overview-dirty' });
       return { status: result.status, error: result.error || '' };
+    });
+
+    // ---------------- IMAP 退信监听 ----------------
+    this.handle('bounce:state', () => (this.bounceWatcher ? this.bounceWatcher.state() : { enabled: false, accounts: [] }));
+
+    this.handle('bounce:check', async (payload) => {
+      if (!this.bounceWatcher) throw new Error('退信监听尚未启动');
+      const summary = await this.bounceWatcher.checkNow({ reason: payload.manual === false ? 'auto' : 'manual', accountId: payload.accountId });
+      return summary;
+    });
+
+    this.handle('bounce:list', (query) => this.db.listBounceEvents(query || {}));
+
+    this.handle('bounce:release', (payload) => {
+      if (!this.bounceWatcher) throw new Error('退信监听尚未启动');
+      const contact = this.bounceWatcher.release(payload.id, { restoreSubscription: payload.restoreSubscription !== false });
+      return contact;
+    });
+
+    this.handle('bounce:test', async (payload) => {
+      if (!this.bounceWatcher) throw new Error('退信监听尚未启动');
+      // 新增账号尚未落库时，界面把当前表单里的 IMAP 配置直接传进来验证
+      if (!payload.id && payload.draft) {
+        const draft = payload.draft || {};
+        return this.bounceWatcher.testAccount({
+          email: draft.email || '',
+          user: draft.user || '',
+          pass: draft.pass || '',
+          enabled: true,
+          imap: Object.assign({ enabled: true }, draft.imap || {}),
+        });
+      }
+      return this.bounceWatcher.test(payload.id);
     });
 
     // ---------------- 维护 ----------------

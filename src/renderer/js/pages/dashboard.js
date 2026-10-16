@@ -108,6 +108,11 @@
             <div class="page-desc">
               当前共收录 <b>${overview.userCount}</b> 位推广联系人，累计投递 <b>${MM.fmtNumber(total)}</b> 封推广邮件。
               下一次定时推广：<b>${overview.nextRunAt ? MM.esc(MM.fmtDate(overview.nextRunAt, true)) : '未设置'}</b>
+              ${
+                overview.bounceMarkedCount
+                  ? `<br/>退信监听已剔除 <b style="color:var(--warn)">${MM.fmtNumber(overview.bounceMarkedCount)}</b> 个退信地址，这些地址不会再收到推广邮件。`
+                  : ''
+              }
             </div>
           </div>
           <div class="page-actions">
@@ -132,9 +137,17 @@
           ${MM.statCard({ label: '当前任务数量', value: overview.campaignCount, sub: `定时启用 ${overview.activeCampaignCount} · 执行中 ${overview.runningCampaignCount}`, tone: 's-info' })}
         </div>
 
-        <div class="cards c3">
+        <div class="cards c4">
           ${MM.statCard({ label: '任务运行次数', value: overview.totalRuns, sub: '含手动与定时触发', tone: 's-info' })}
           ${MM.statCard({ label: '今日发送', value: today.total || 0, sub: `成功 ${today.success || 0} · 失败 ${today.failed || 0} · 退信 ${today.bounced || 0}` })}
+          ${MM.statCard({
+            label: '退信剔除地址',
+            value: overview.bounceMarkedCount || 0,
+            sub: `累计退信事件 ${MM.fmtNumber(overview.bounceEventCount || 0)} 条 · ${
+              overview.lastImapCheckAt ? `上次监听检查 ${MM.esc(MM.fmtDate(overview.lastImapCheckAt, true).slice(5, 16))}` : 'IMAP 尚未执行检查'
+            }`,
+            tone: overview.bounceMarkedCount ? 's-warn' : '',
+          })}
           ${MM.statCard({
             label: '下次启动推广倒计时',
             value: `<span class="mono" id="cd-big" style="font-size:22px;color:${cd.idle ? 'var(--text-faint)' : '#9fd0ff'}">${cd.text}</span>`,
@@ -187,6 +200,7 @@
                   <button class="btn btn-sm" data-goto="contacts">＋ 添加联系人</button>
                   <button class="btn btn-sm" data-goto="templates">＋ 新建模板</button>
                   <button class="btn btn-sm" data-goto="campaigns">＋ 临时推广任务</button>
+                  <button class="btn btn-sm" data-goto="bounce">退信监听</button>
                   <button class="btn btn-sm" data-goto="settings">SMTP 设置</button>
                 </div>
               </div>

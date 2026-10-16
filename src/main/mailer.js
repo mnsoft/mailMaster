@@ -113,7 +113,8 @@ function textToHtml(text) {
  * @param {object} template 模板
  * @param {object} contact 收件人
  * @param {object} settings 全局设置
- * @param {object} extra { account, index, total, now } —— account 为本封实际使用的发信账号
+ * @param {object} extra { account, index, total, now, spintax } —— account 为本封实际使用的发信账号；
+ *        spintax 为 { subjectUsed, bodyUsed } 时启用逐封去重（保证同批次措辞尽量不重复）
  */
 function renderMail(template, contact, settings, extra = {}) {
   const account = extra.account || null;
@@ -124,7 +125,7 @@ function renderMail(template, contact, settings, extra = {}) {
     index: extra.index,
     total: extra.total,
   });
-  const rendered = renderMessage(template, contact, globals);
+  const rendered = renderMessage(template, contact, globals, { spintax: extra.spintax });
   let body = rendered.body;
   if (settings.appendFooter && settings.footerText) {
     body = `${body}\n\n————————————\n${settings.footerText}`;
@@ -147,6 +148,7 @@ function renderMail(template, contact, settings, extra = {}) {
     missing: rendered.missing,
     missingText: rendered.missingText,
     variables: rendered.variables,
+    spintax: rendered.spintax,
   };
 }
 

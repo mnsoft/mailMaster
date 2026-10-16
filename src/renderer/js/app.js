@@ -86,6 +86,13 @@
         case 'log':
           MM.state.dirty.overview = true;
           break;
+        case 'bounce-event':
+          // 退信监听识别到新退信：看板与退信页面的数据都需要重新拉取
+          MM.state.dirty.overview = true;
+          break;
+        case 'bounce-state':
+          MM.state.dirty.overview = true;
+          break;
         case 'overview-dirty':
           MM.state.dirty.overview = true;
           break;

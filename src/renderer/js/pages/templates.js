@@ -2,7 +2,7 @@
 (function () {
   const MM = window.MM;
 
-  const state = { templates: [], fields: null, currentId: null, sampleContactId: null, contacts: [] };
+  const state = { templates: [], fields: null, currentId: null, sampleContactId: null, contacts: [], audienceEstimate: 0, lastVariants: 1 };
 
   /** 组装「独立窗口预览」所需的数据（与主界面预览解耦，窗口只负责渲染） */
   function buildWindowPayload(data, extra) {
@@ -59,6 +59,22 @@
         </div>
       </div>
 
+      <div class="panel" style="margin:0 0 16px">
+        <div class="panel-head">
+          <div class="panel-title">Spintax 同义词轮换 <span class="hint">让每封邮件的主题与正文都不一样</span></div>
+          <button class="btn btn-sm btn-ghost" data-act="insert-spin">插入同义词组</button>
+        </div>
+        <div class="panel-body">
+          <div class="field-hint" style="line-height:1.9;margin-bottom:10px">
+            用大括号加竖线写多个说法，例：<span class="mono">{您好|你好|打扰了}</span> —— 发送时每封邮件会随机取其中一个。
+            支持嵌套（<span class="mono">{您好|{早上好|下午好}}</span>），需要用大括号本身时写成 <span class="mono">\{</span>。
+            本应用只把「含竖线的大括号组」当作 Spintax，因此与 <span class="mono">{{变量}}</span> 语法不会冲突。
+          </div>
+          <div class="stat-inline" data-role="spintax-stat">—</div>
+          <div data-role="spintax-samples" style="margin-top:10px"></div>
+        </div>
+      </div>
+
       <div class="field">
         <label class="field-label">预览使用的样例联系人</label>
         <select class="select" data-role="sample">
@@ -102,6 +118,8 @@
       state.templates = templates;
       if (fieldsRes.ok) state.fields = fieldsRes.data;
       state.contacts = contactsRes.ok ? contactsRes.data.items : [];
+      // 可用于群发的地址数（listContacts('active') 已排除退订与退信标记）
+      state.audienceEstimate = state.contacts.length;
       if (!state.currentId || !templates.some((t) => t.id === state.currentId)) {
         state.currentId = templates.length ? templates[0].id : null;
       }
@@ -109,7 +127,8 @@
       view.innerHTML = `
         <div class="page-head">
           <div class="page-desc">
-            在模板中使用 <span class="mono">{{变量}}</span> 编写推广内容，发送时会自动替换为对应收件人的公司名、联系人、称呼、电话等信息。
+            在模板中使用 <span class="mono">{{变量}}</span> 编写推广内容，发送时会自动替换为对应收件人的公司名、联系人、称呼、电话等信息；
+            用 <span class="mono">{说法一|说法二}</span> 写同义词轮换（Spintax），可使每封邮件的主题与正文都不相同。
             变量支持中文名与常见别名（如 <span class="mono">{{公司}}</span>、<span class="mono">{{姓名}}</span>、<span class="mono">{{尊称}}</span>）。
           </div>
           <div class="page-actions">
@@ -138,6 +157,7 @@
               <div class="panel-head">
                 <div class="panel-title">当前模板预览</div>
                 <div class="panel-head-actions">
+                  <button class="btn btn-sm btn-ghost" data-act="reroll" title="重新随机一组同义词，查看另一个版本">换一组措辞</button>
                   <button class="btn btn-sm btn-ghost" data-act="preview-window" title="在独立窗口中按完整尺寸查看邮件样式">独立窗口预览</button>
                   <button class="btn btn-sm btn-ghost" data-act="refresh-preview">刷新预览</button>
                 </div>
@@ -160,6 +180,8 @@
       const previewLabel = view.querySelector('[data-role="preview-label"]');
       let previewTimer = null;
       let previewSeq = 0;
+      // 当前预览使用的 Spintax 组合序号（0 = 第一组措辞）；「换一组措辞」会把它换成一个随机序号
+      let spinIndex = 0;
 
       const getCurrent = () => state.templates.find((t) => t.id === state.currentId) || null;
 
@@ -193,13 +215,16 @@
         const sample = editor.querySelector('[data-role="sample"]');
         body.addEventListener('input', () => {
           updateScan();
+          updateSpintax();
           schedulePreview();
         });
         body.addEventListener('keyup', updateScan);
         subject.addEventListener('input', () => {
           updateScan();
+          updateSpintax();
           schedulePreview();
         });
+        editor.querySelector('[data-act="insert-spin"]').onclick = insertSpin;
         if (sample) {
           sample.addEventListener('change', () => {
             state.sampleContactId = sample.value || null;
@@ -207,8 +232,57 @@
           });
         }
         updateScan();
+        updateSpintax();
         // 切换模板 / 新建 / 保存后同步刷新右侧预览
         renderPreview();
+      };
+
+      /** Spintax 统计：可产生多少种不同内容，是否足以覆盖本批收件人 */
+      const updateSpintax = () => {
+        const subject = editor.querySelector('[data-role="subject"]');
+        const body = editor.querySelector('[data-role="body"]');
+        const statEl = editor.querySelector('[data-role="spintax-stat"]');
+        const sampleEl = editor.querySelector('[data-role="spintax-samples"]');
+        if (!subject || !statEl) return;
+        MM.api.spintaxInfo({ subject: subject.value, body: body.value }).then((res) => {
+          if (!res.ok || !statEl.isConnected) return;
+          const info = res.data;
+          state.lastVariants = info.totalVariants || 1;
+          if (!info.hasSpintax) {
+            statEl.className = 'stat-inline warn';
+            statEl.innerHTML =
+              '未使用 Spintax：<b>所有邮件的主题与正文完全相同</b>。' +
+              '建议至少给问候语与主题各加一组同义词，例：<span class="mono">{您好|你好}</span>。';
+            sampleEl.innerHTML = '';
+            return;
+          }
+          const audienceSize = state.audienceEstimate || 0;
+          const enough = !audienceSize || info.totalVariants >= audienceSize;
+          statEl.className = `stat-inline ${enough ? 'ok' : 'warn'}`;
+          statEl.innerHTML = `本模板可产生 <b>${MM.fmtNumber(info.totalVariants)}</b> 种不同内容（主题 ${info.subjectVariants} 种 × 正文 ${info.bodyVariants} 种）${
+            audienceSize ? `，当前推广列表约 ${MM.fmtNumber(audienceSize)} 个地址` : ''
+          }${enough ? '，可覆盖整批收件人' : '，少于收件人数，超出部分会重复'}。`;
+          sampleEl.innerHTML = info.samples?.length
+            ? `<div class="field-label" style="margin-bottom:6px">随机抽样（每次刷新都不同）</div>${info.samples
+                .map((s) => `<div class="spin-sample"><span class="mono">${MM.esc(s.subject)}</span><div class="sub">${MM.esc(s.body)}</div></div>`)
+                .join('')}`
+            : '';
+        });
+      };
+
+      /** 把选中的正文包裹成 Spintax 组，便于快速上手 */
+      const insertSpin = () => {
+        const body = editor.querySelector('[data-role="body"]');
+        const start = body.selectionStart ?? body.value.length;
+        const end = body.selectionEnd ?? body.value.length;
+        const selected = body.value.slice(start, end).trim();
+        const text = selected ? `{${selected}|${selected}}` : '{说法一|说法二}';
+        body.value = `${body.value.slice(0, start)}${text}${body.value.slice(end)}`;
+        body.focus();
+        body.selectionStart = body.selectionEnd = start + text.length;
+        updateScan();
+        updateSpintax();
+        schedulePreview();
       };
 
       const updateScan = () => {
@@ -260,7 +334,7 @@
         }
 
         const seq = ++previewSeq;
-        const res = await MM.api.previewTemplate({ subject, body, contactId: sampleId });
+        const res = await MM.api.previewTemplate({ subject, body, contactId: sampleId, spinIndex });
         if (seq !== previewSeq || !previewBox.isConnected) return; // 只采用最后一次请求的结果
 
         if (!res.ok) {
@@ -269,7 +343,12 @@
         }
 
         const { contact, rendered } = res.data;
-        previewLabel.innerHTML = `样例联系人 <b>${MM.esc(contact.company)}</b> · ${MM.esc(contact.contact)}`;
+        const spin = rendered.spintax || {};
+        previewLabel.innerHTML = `样例联系人 <b>${MM.esc(contact.company)}</b> · ${MM.esc(contact.contact)}${
+          spin.totalVariants > 1
+            ? ` <span class="hint">· 第 ${MM.fmtNumber((spin.subjectIndex || 0) * (spin.bodyVariants || 1) + (spin.bodyIndex || 0) + 1)} / ${MM.fmtNumber(spin.totalVariants)} 种措辞</span>`
+            : ''
+        }`;
         previewBox.innerHTML = `
           <div class="pill-row" style="margin-bottom:10px">
             <span class="pill">公司名 <b>${MM.esc(contact.company)}</b></span>
@@ -395,6 +474,21 @@
 
       view.querySelector('[data-act="refresh-preview"]').onclick = (e) => {
         const restore = MM.spinBtn(e.target, '生成中');
+        renderPreview().finally(restore);
+      };
+
+      /** 换一组措辞：随机切到另一个 Spintax 组合，直观看到「每封邮件都不一样」 */
+      view.querySelector('[data-act="reroll"]').onclick = (e) => {
+        const total = state.lastVariants || 1;
+        if (total <= 1) {
+          MM.toast('当前模板还没有 Spintax 同义词，先在下方的「Spintax 同义词轮换」里插入一组吧', 'warn', 6000);
+          return;
+        }
+        let next = spinIndex;
+        for (let i = 0; i < 24 && next === spinIndex; i += 1) next = Math.floor(Math.random() * total) % total;
+        if (next === spinIndex) next = (spinIndex + 1) % total;
+        spinIndex = next;
+        const restore = MM.spinBtn(e.target, '换一组');
         renderPreview().finally(restore);
       };
 

@@ -10,6 +10,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { JsonStore } = require('./store');
 const { scheduleNextRun } = require('./scheduler');
+const pacing = require('./pacing');
 
 const LOG_STATUS = {
   PENDING: 'pending',
@@ -35,6 +36,17 @@ function uid(prefix) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+/** IMAP 监听里属于「运行时状态」的字段：保存账号时要保留，不能被表单覆盖 */
+const IMAP_RUNTIME_KEYS = ['lastCheckAt', 'lastError', 'lastFound'];
+
+function pickImapRuntime(imap) {
+  const out = {};
+  for (const key of IMAP_RUNTIME_KEYS) {
+    if (imap && imap[key] !== undefined) out[key] = imap[key];
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +180,9 @@ function seedData() {
       tags,
       remark: '',
       subscribed: true,
+      // 退信标记：被标记后自动从所有推广的发送列表中剔除，直到手动解除
+      bounceMarked: false,
+      bounceInfo: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
       stats,
@@ -181,19 +196,19 @@ function seedData() {
     {
       id: uid('tpl'),
       name: '标准产品推广（中文）',
-      subject: '{{公司名}} · 关于智能采集方案的沟通（{{联系人}}）',
+      subject: '{{公司名}} · {关于|聊聊}{智能采集|数据采集}方案的{沟通|交流}（{{联系人}}）',
       body: [
         '尊敬的{{称呼}}{{联系人}}：',
         '',
-        '您好！我是{{发件方公司}}的{{发件人}}。',
+        '{您好|你好|打扰了}！我是{{发件方公司}}的{{发件人}}。',
         '',
-        '了解到{{公司名}}在{{城市}}的业务发展，我们近期为同行业客户落地的「智能数据采集与自动化处理方案」或许对您有帮助：',
+        '{了解到|关注到}{{公司名}}在{{城市}}的业务发展，我们近期为同行业客户落地的「智能数据采集与自动化处理方案」{或许对您有帮助|应该能派上用场}：',
         '',
         '· 采集效率提升 3 倍以上，人工成本下降约 40%',
         '· 支持与现有系统无缝对接，7 天即可完成部署',
         '· 提供 30 天免费试用与专属技术支持',
         '',
-        '如果方便，我可以在本周内为您安排一次 20 分钟的线上演示。您看什么时间合适？',
+        '如果方便，我可以在本周内为您安排一次 20 分钟的线上演示。{您看什么时间合适？|不知您哪天方便？}',
         '',
         '期待与{{公司名}}的合作。',
         '',
@@ -207,14 +222,14 @@ function seedData() {
     {
       id: uid('tpl'),
       name: '简短跟进（老客户）',
-      subject: '{{联系人}}您好，{{公司名}}的方案跟进',
+      subject: '{{{联系人}}您好|致{{称呼}}{{联系人}}}，{{公司名}}的{方案跟进|资料更新}',
       body: [
-        '{{称呼}}{{联系人}}，您好：',
+        '{{称呼}}{{联系人}}，{您好|好久不见}：',
         '',
-        '上次与您沟通的方案已更新到最新版本，其中针对{{公司名}}关注的成本问题做了优化。',
+        '上次与您沟通的方案{已更新到最新版本|刚刚完成一轮升级}，其中针对{{公司名}}关注的成本问题做了{专项优化|重点调整}。',
         '方便的话我给您发一份最新资料，您电话{{电话}}是否仍可联系？',
         '',
-        '顺祝商祺！',
+        '{顺祝商祺！|祝工作顺利！}',
         '{{发件人}} · {{发件方公司}}',
         '{{日期时间}}',
       ].join('\n'),
@@ -239,6 +254,17 @@ function seedData() {
       enabled: true,
       isDefault: true,
       dailyLimit: 200,
+      imap: {
+        enabled: false,
+        host: 'imap.example.com',
+        port: 993,
+        secure: true,
+        user: '',
+        pass: '',
+        mailbox: 'INBOX',
+        markSeen: true,
+        searchDays: 30,
+      },
       createdAt: nowIso(),
       updatedAt: nowIso(),
     },
@@ -257,6 +283,17 @@ function seedData() {
       enabled: true,
       isDefault: false,
       dailyLimit: 100,
+      imap: {
+        enabled: true,
+        host: 'imap.example.com',
+        port: 993,
+        secure: true,
+        user: '',
+        pass: '',
+        mailbox: 'INBOX',
+        markSeen: true,
+        searchDays: 30,
+      },
       createdAt: nowIso(),
       updatedAt: nowIso(),
     },
@@ -302,10 +339,24 @@ function seedData() {
       description: '每月固定两次向全部有效客户发送标准产品推广',
       templateId: templates[0].id,
       accountId: accounts[0].id,
+      accountMode: 'pool',
+      accountIds: [accounts[0].id, accounts[1].id],
+      accountStrategy: 'roundRobin',
       kind: 'scheduled',
       schedule: { type: 'monthly', days: [1, 15], time: '09:30' },
       audience: { mode: 'all', tags: [], ids: [] },
-      throttle: { intervalSeconds: 6, dailyLimit: 200, maxRetries: 1 },
+      throttle: {
+        mode: 'random',
+        intervalSeconds: 6,
+        delayMinSeconds: 20,
+        delayMaxSeconds: 90,
+        burstEvery: 10,
+        burstMinSeconds: 180,
+        burstMaxSeconds: 420,
+        hourlyLimit: 60,
+        dailyLimit: 200,
+        maxRetries: 1,
+      },
       dryRun: true,
       status: 'paused',
       runCount: 0,
@@ -321,10 +372,24 @@ function seedData() {
       description: '手动触发的临时推广，仅发送给「医疗行业」标签客户',
       templateId: templates[1].id,
       accountId: accounts[1].id,
+      accountMode: 'single',
+      accountIds: [],
+      accountStrategy: 'roundRobin',
       kind: 'manual',
       schedule: { type: 'manual' },
       audience: { mode: 'tags', tags: ['医疗行业'], ids: [] },
-      throttle: { intervalSeconds: 5, dailyLimit: 100, maxRetries: 2 },
+      throttle: {
+        mode: 'random',
+        intervalSeconds: 5,
+        delayMinSeconds: 30,
+        delayMaxSeconds: 120,
+        burstEvery: 8,
+        burstMinSeconds: 240,
+        burstMaxSeconds: 600,
+        hourlyLimit: 40,
+        dailyLimit: 100,
+        maxRetries: 2,
+      },
       dryRun: true,
       status: 'draft',
       runCount: 0,
@@ -374,6 +439,51 @@ function seedData() {
     c.lastSentAt = ts;
   }
 
+  // 演示用：给历史上退信的地址打上退信标记（真实场景由 IMAP 监听自动完成）
+  const bounceEvents = [];
+  for (const c of contacts) {
+    if (c.lastStatus !== LOG_STATUS.BOUNCED) continue;
+    const at = c.lastSentAt;
+    c.bounceMarked = true;
+    c.bounceInfo = {
+      at,
+      type: 'hard',
+      status: '5.1.1',
+      reason: '状态码 5.1.1 · 动作 failed · 550 5.1.1 收件人地址不存在',
+      diagnostic: 'smtp; 550 5.1.1 <' + c.email + '>: Recipient address rejected: User unknown in local recipient table',
+      subject: 'Mail Delivery System · Undelivered Mail Returned to Sender',
+      accountEmail: accounts[1].email,
+      source: 'imap',
+      eventId: null,
+    };
+    bounceEvents.push({
+      id: uid('bn'),
+      accountId: accounts[1].id,
+      accountEmail: accounts[1].email,
+      uid: 1000 + bounceEvents.length,
+      type: 'hard',
+      status: '5.1.1',
+      diagnostic: 'smtp; 550 5.1.1 Recipient address rejected: User unknown in local recipient table',
+      reason: '状态码 5.1.1 · 动作 failed · 550 5.1.1 收件人地址不存在',
+      subject: 'Mail Delivery System · Undelivered Mail Returned to Sender',
+      from: 'MAILER-DAEMON@example.com',
+      date: new Date(at).toUTCString(),
+      originalMessageId: '',
+      recipients: [c.email],
+      contactId: c.id,
+      email: c.email,
+      company: c.company,
+      contactName: c.contact,
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      logId: null,
+      source: 'imap',
+      matched: true,
+      createdAt: at,
+    });
+    c.bounceInfo.eventId = bounceEvents[bounceEvents.length - 1].id;
+  }
+
   const counters = {
     totalRuns: 3,
     totalAttempts: logs.length,
@@ -397,9 +507,26 @@ function seedData() {
       },
       senderCompany: '示例智能科技有限公司',
       sendMode: 'dryRun',
-      defaultThrottle: { intervalSeconds: 6, dailyLimit: 200, maxRetries: 1 },
+      defaultThrottle: {
+        mode: 'random',
+        intervalSeconds: 6,
+        delayMinSeconds: 20,
+        delayMaxSeconds: 90,
+        burstEvery: 10,
+        burstMinSeconds: 180,
+        burstMaxSeconds: 420,
+        hourlyLimit: 60,
+        dailyLimit: 200,
+        maxRetries: 1,
+      },
       bounceAutoPause: true,
       bouncePauseThreshold: 5,
+      // IMAP 退信自动监听
+      imapAutoCheck: true,
+      imapPollMinutes: 5,
+      imapAutoMarkBounce: true,
+      imapBounceType: 'hard',
+      imapLastCheckAt: null,
       appendFooter: true,
       footerText: '如不希望再收到此类邮件，请回复「退订」，我们将立即为您移除。',
       logRetentionDays: 180,
@@ -409,6 +536,7 @@ function seedData() {
     accounts,
     campaigns,
     logs,
+    bounceEvents: [],
     counters,
   };
 }
@@ -434,9 +562,95 @@ class Database {
     data.logs = data.logs || [];
     data.accounts = data.accounts || [];
     data.counters = data.counters || { totalRuns: 0, totalAttempts: 0, success: 0, failed: 0, bounced: 0 };
+    data.bounceEvents = data.bounceEvents || [];
     data.settings = Object.assign(seedData().settings, data.settings || {});
     this.migrateLegacySmtp();
+    this.normalizeStructure();
     return data;
+  }
+
+  /**
+   * 结构归一：为旧数据补齐后续版本新增的字段
+   *  - 联系人：退信标记（旧版本是把硬退信直接置为「已退订」，这里补上可解除的退信标记）
+   *  - 发信账号：IMAP 退信监听配置
+   *  - 推广任务：账号池与发送节奏
+   */
+  normalizeStructure() {
+    const data = this.data;
+    let changed = false;
+
+    for (const c of data.contacts || []) {
+      if (c.bounceMarked === undefined) {
+        c.bounceMarked = Boolean(c.subscribed === false && c.stats && c.stats.bounced > 0);
+        changed = true;
+      }
+      if (c.bounceInfo === undefined) {
+        c.bounceInfo = null;
+        changed = true;
+      }
+    }
+
+    const imapDefaults = {
+      enabled: false,
+      host: '',
+      port: 993,
+      secure: true,
+      user: '',
+      pass: '',
+      mailbox: 'INBOX',
+      markSeen: true,
+      searchDays: 30,
+      allowInsecure: false,
+    };
+    for (const a of data.accounts || []) {
+      if (!a.imap) {
+        a.imap = Object.assign({}, imapDefaults);
+        changed = true;
+        continue;
+      }
+      for (const [key, value] of Object.entries(imapDefaults)) {
+        if (a.imap[key] === undefined) {
+          a.imap[key] = value;
+          changed = true;
+        }
+      }
+    }
+
+    for (const cp of data.campaigns || []) {
+      const nextMode = cp.accountMode === 'pool' ? 'pool' : 'single';
+      if (cp.accountMode !== nextMode) {
+        cp.accountMode = nextMode;
+        changed = true;
+      }
+      if (!Array.isArray(cp.accountIds)) {
+        cp.accountIds = [];
+        changed = true;
+      }
+      const nextStrategy = cp.accountStrategy === 'random' ? 'random' : 'roundRobin';
+      if (cp.accountStrategy !== nextStrategy) {
+        cp.accountStrategy = nextStrategy;
+        changed = true;
+      }
+      const normalized = pacing.normalize(cp.throttle || {});
+      if (JSON.stringify(normalized) !== JSON.stringify(cp.throttle || {})) {
+        cp.throttle = normalized;
+        changed = true;
+      }
+      // 池模式至少需要勾选两个账号，否则回落到单账号，避免出现「轮询却只有一个号」
+      if (cp.accountMode === 'pool' && cp.accountIds.length < 2) {
+        cp.accountMode = 'single';
+        changed = true;
+      }
+    }
+
+    const throttle = pacing.normalize(data.settings.defaultThrottle || {});
+    if (JSON.stringify(throttle) !== JSON.stringify(data.settings.defaultThrottle || {})) {
+      data.settings.defaultThrottle = throttle;
+      changed = true;
+    }
+
+    if (changed) this.store.saveThrottled(500);
+    return changed;
   }
 
   /**
@@ -544,6 +758,18 @@ class Database {
       remark: input.remark || '',
       enabled: input.enabled !== false,
       dailyLimit: Number(input.dailyLimit) || 0,
+      imap: {
+        enabled: !!input.imap?.enabled,
+        host: String(input.imap?.host || '').trim(),
+        port: Number(input.imap?.port) || 993,
+        secure: input.imap?.secure !== false,
+        user: String(input.imap?.user || '').trim(),
+        pass: input.imap?.pass || '',
+        mailbox: String(input.imap?.mailbox || '').trim() || 'INBOX',
+        markSeen: input.imap?.markSeen !== false,
+        searchDays: Number(input.imap?.searchDays) || 30,
+        allowInsecure: !!input.imap?.allowInsecure,
+      },
       ses:
         provider === 'tencent-ses'
           ? {
@@ -570,7 +796,10 @@ class Database {
       account = this.getAccount(input.id);
       if (!account) throw new Error('发信账号不存在');
       const wasDefault = account.isDefault;
+      // 保留 IMAP 监听的运行时状态，避免编辑账号后丢失「上次检查时间 / 上次错误」
+      const runtimeImap = pickImapRuntime(account.imap);
       Object.assign(account, payload, { updatedAt: nowIso(), isDefault: wasDefault });
+      account.imap = Object.assign({}, account.imap, runtimeImap);
       if (wasDefault) this.ensureSingleDefault(account.id);
     } else {
       account = Object.assign({ id: uid('acc'), isDefault: false, createdAt: nowIso(), updatedAt: nowIso() }, payload);
@@ -687,8 +916,9 @@ class Database {
     }
     if (filter.tag) list = list.filter((c) => (c.tags || []).includes(filter.tag));
     if (filter.status === 'hasBounce') list = list.filter((c) => (c.stats?.bounced || 0) > 0);
+    if (filter.status === 'bounceMarked') list = list.filter((c) => c.bounceMarked);
     if (filter.status === 'unsubscribed') list = list.filter((c) => c.subscribed === false);
-    if (filter.status === 'active') list = list.filter((c) => c.subscribed !== false);
+    if (filter.status === 'active') list = list.filter((c) => c.subscribed !== false && !c.bounceMarked);
     return list;
   }
 
@@ -737,6 +967,8 @@ class Database {
       tags: Array.isArray(input.tags) ? input.tags : String(input.tags || '').split(/[|,、]/).filter(Boolean),
       remark: input.remark || '',
       subscribed: input.subscribed !== false,
+      bounceMarked: false,
+      bounceInfo: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
       stats: { attempts: 0, success: 0, failed: 0, bounced: 0 },
@@ -866,15 +1098,26 @@ class Database {
 
   saveCampaign(input) {
     if (!String(input.name || '').trim()) throw new Error('任务名称不能为空');
+
+    // 账号池：池模式至少勾选两个账号，否则自动回落到单账号，避免出现「名为轮询实际只有一个号」
+    const known = new Set((this.data.accounts || []).map((a) => a.id));
+    let accountIds = Array.isArray(input.accountIds) ? input.accountIds.filter((id) => known.has(id)) : [];
+    accountIds = Array.from(new Set(accountIds));
+    const accountMode = input.accountMode === 'pool' && accountIds.length >= 2 ? 'pool' : 'single';
+    const accountStrategy = input.accountStrategy === 'random' ? 'random' : 'roundRobin';
+
     const payload = {
       name: input.name,
       description: input.description || '',
       templateId: input.templateId || null,
       accountId: input.accountId || null,
+      accountMode,
+      accountIds: accountMode === 'pool' ? accountIds : [],
+      accountStrategy,
       kind: input.kind === 'manual' ? 'manual' : 'scheduled',
       schedule: input.schedule || { type: 'manual' },
       audience: input.audience || { mode: 'all', tags: [], ids: [] },
-      throttle: Object.assign({ intervalSeconds: 6, dailyLimit: 200, maxRetries: 1 }, input.throttle || {}),
+      throttle: pacing.normalize(Object.assign({}, this.data.settings.defaultThrottle || {}, input.throttle || {})),
       dryRun: input.dryRun !== false,
       status: input.status || 'draft',
     };
@@ -915,9 +1158,12 @@ class Database {
     return true;
   }
 
-  /** 命中受众的联系人（自动排除已退订者） */
+  /**
+   * 命中受众的联系人
+   * 自动排除：已退订者、已打退信标记者（退信标记需在「退信监听」页面手动解除后才会重新进入列表）
+   */
   resolveAudience(audience = {}) {
-    const all = this.data.contacts.filter((c) => c.subscribed !== false);
+    const all = this.data.contacts.filter((c) => c.subscribed !== false && !c.bounceMarked);
     if (audience.mode === 'tags' && Array.isArray(audience.tags) && audience.tags.length) {
       return all.filter((c) => (c.tags || []).some((t) => audience.tags.includes(t)));
     }
@@ -926,6 +1172,16 @@ class Database {
       return all.filter((c) => set.has(c.id));
     }
     return all;
+  }
+
+  /** 受众解析过程中被剔除的联系人（用于界面提示为什么人数比预期少） */
+  audienceExclusions() {
+    const contacts = this.data.contacts || [];
+    return {
+      unsubscribed: contacts.filter((c) => c.subscribed === false).length,
+      bounceMarked: contacts.filter((c) => c.bounceMarked).length,
+      total: contacts.length,
+    };
   }
 
   // ---------------- logs ----------------
@@ -1015,21 +1271,134 @@ class Database {
     else if (status === LOG_STATUS.FAILED) c.stats.failed += 1;
     c.lastStatus = status;
     c.lastSentAt = nowIso();
-    if (status === LOG_STATUS.BOUNCED) c.subscribed = false; // 硬退信自动移入黑名单
+    // 投递时即被拒收：直接打退信标记，后续推广不再发送该地址（标记可在「退信监听」页面解除）
+    if (status === LOG_STATUS.BOUNCED) {
+      this.markContactBounce(
+        contactId,
+        { type: 'hard', reason: 'SMTP 投递时被拒收（硬退信）', source: 'smtp' },
+        { silent: true },
+      );
+    }
     this.store.saveThrottled();
   }
 
-  markContactBounced(id, note) {
+  /**
+   * 给联系人打退信标记：该地址会从所有推广的发送列表中剔除
+   * @param {string} id 联系人 id
+   * @param {object} info { type, status, reason, diagnostic, subject, accountEmail, eventId, source, note }
+   * @param {{ silent?: boolean }} [options] silent 为 true 时不再重复累加统计（调用方已累加）
+   */
+  markContactBounce(id, info = {}, options = {}) {
     const c = this.getContact(id);
     if (!c) throw new Error('联系人不存在');
+    c.bounceMarked = true;
+    c.bounceInfo = {
+      at: nowIso(),
+      type: info.type || 'hard',
+      status: info.status || '',
+      reason: info.reason || '',
+      diagnostic: info.diagnostic || '',
+      subject: info.subject || '',
+      accountEmail: info.accountEmail || '',
+      source: info.source || 'imap',
+      eventId: info.eventId || null,
+    };
     c.stats = c.stats || { attempts: 0, success: 0, failed: 0, bounced: 0 };
-    c.stats.bounced += 1;
+    if (!options.silent) {
+      c.stats.bounced += 1;
+      this.bumpCounters({ bounced: 1 });
+    }
     c.lastStatus = LOG_STATUS.BOUNCED;
-    c.subscribed = false;
-    c.remark = note ? `${c.remark ? `${c.remark} / ` : ''}手动标记退信：${note}` : c.remark;
-    this.bumpCounters({ bounced: 1 });
+    if (info.note) c.remark = `${c.remark ? `${c.remark} / ` : ''}手动标记退信：${info.note}`;
+    c.updatedAt = nowIso();
     this.store.saveThrottled(100);
     return c;
+  }
+
+  /**
+   * 解除退信标记：使该地址重新进入发送列表
+   * @param {string} id
+   * @param {{ restoreSubscription?: boolean }} [options] restoreSubscription 默认 true ——
+   *        旧版本把硬退信直接置为「已退订」，解除标记时一并恢复订阅状态，否则地址仍会被排除
+   */
+  releaseContactBounce(id, options = {}) {
+    const c = this.getContact(id);
+    if (!c) throw new Error('联系人不存在');
+    if (!c.bounceMarked) return c;
+    const previous = c.bounceInfo || {};
+    c.bounceMarked = false;
+    c.bounceInfo = null;
+    if (options.restoreSubscription !== false) c.subscribed = true;
+    if (previous.at) {
+      const stamp = String(previous.at).slice(0, 19).replace('T', ' ');
+      c.remark = `${c.remark ? `${c.remark} / ` : ''}于 ${stamp} 解除退信标记`;
+    }
+    c.updatedAt = nowIso();
+    this.store.saveThrottled(100);
+    return c;
+  }
+
+  /** 手动标记退信（保留旧接口，供界面上的个体操作使用） */
+  markContactBounced(id, note) {
+    return this.markContactBounce(id, { type: 'hard', source: 'manual', note, reason: note || '人工标记为退信' });
+  }
+
+  /** 按邮箱查找联系人（退信报告里只有地址时的匹配依据） */
+  getContactByEmail(email) {
+    const target = String(email || '').trim().toLowerCase();
+    if (!target) return null;
+    return this.data.contacts.find((c) => String(c.email || '').toLowerCase() === target) || null;
+  }
+
+  /** 按 Message-ID 找投递记录（退信报告精确匹配的依据） */
+  findLogByMessageId(messageId) {
+    const target = String(messageId || '').trim().replace(/^<|>$/g, '').toLowerCase();
+    if (!target) return null;
+    for (let i = this.data.logs.length - 1; i >= 0; i -= 1) {
+      const mid = String(this.data.logs[i].messageId || '').replace(/^<|>$/g, '').toLowerCase();
+      if (mid && mid === target) return this.data.logs[i];
+    }
+    return null;
+  }
+
+  // ---------------- 退信事件（IMAP 监听结果） ----------------
+  hasBounceEvent(accountId, uid) {
+    return (this.data.bounceEvents || []).some((e) => e.accountId === accountId && Number(e.uid) === Number(uid));
+  }
+
+  addBounceEvent(entry) {
+    const event = Object.assign({ id: uid('bn'), createdAt: nowIso(), source: 'imap', matched: false }, entry);
+    this.data.bounceEvents = this.data.bounceEvents || [];
+    this.data.bounceEvents.unshift(event);
+    this.store.saveThrottled(150);
+    return event;
+  }
+
+  listBounceEvents(query = {}) {
+    let list = [...(this.data.bounceEvents || [])];
+    if (query.accountId) list = list.filter((e) => e.accountId === query.accountId);
+    if (query.type && query.type !== 'all') list = list.filter((e) => e.type === query.type);
+    if (query.matched === 'unmatched') list = list.filter((e) => !e.matched);
+    if (query.matched === 'matched') list = list.filter((e) => e.matched);
+    const keyword = String(query.keyword || '').trim().toLowerCase();
+    if (keyword) {
+      list = list.filter((e) =>
+        [e.email, e.company, e.contactName, e.subject, e.status, e.diagnostic, e.accountEmail]
+          .join(' ')
+          .toLowerCase()
+          .includes(keyword),
+      );
+    }
+    return { total: list.length, items: list.slice(0, query.limit || 200) };
+  }
+
+  /** 更新账号的 IMAP 监听运行时状态 */
+  setAccountImapState(accountId, patch = {}) {
+    const account = this.getAccount(accountId);
+    if (!account) return null;
+    account.imap = Object.assign({}, account.imap || {}, patch);
+    this.store.saveThrottled(300);
+    return account.imap;
   }
 
   // ---------------- counters & stats ----------------
@@ -1070,11 +1439,15 @@ class Database {
       .sort((a, b) => new Date(a.nextRunAt) - new Date(b.nextRunAt));
 
     const emails = new Set(data.contacts.map((x) => (x.email || '').toLowerCase()).filter(Boolean));
+    const bounceEvents = data.bounceEvents || [];
     return {
       userCount: data.contacts.length,
       uniqueEmailCount: emails.size,
-      activeContactCount: data.contacts.filter((x) => x.subscribed !== false).length,
+      activeContactCount: data.contacts.filter((x) => x.subscribed !== false && !x.bounceMarked).length,
       bouncedContactCount: data.contacts.filter((x) => (x.stats?.bounced || 0) > 0).length,
+      bounceMarkedCount: data.contacts.filter((x) => x.bounceMarked).length,
+      bounceEventCount: bounceEvents.length,
+      lastImapCheckAt: data.settings.imapLastCheckAt || null,
       totalAttempts: c.totalAttempts || 0,
       successCount: c.success || 0,
       failedCount: c.failed || 0,
@@ -1094,6 +1467,7 @@ class Database {
         provider: a.provider || 'smtp',
         isDefault: a.isDefault,
         enabled: a.enabled !== false,
+        imapEnabled: !!a.imap?.enabled,
         todayUsed: this.accountUsageToday(a.email),
         dailyLimit: a.dailyLimit || 0,
         freeQuotaRemaining:
@@ -1164,6 +1538,10 @@ class Database {
     const cutoff = Date.now() - days * 24 * 3600 * 1000;
     const before = this.data.logs.length;
     this.data.logs = this.data.logs.filter((l) => new Date(l.createdAt || 0).getTime() >= cutoff);
+    // 退信事件同步按同一保留期清理
+    if (Array.isArray(this.data.bounceEvents)) {
+      this.data.bounceEvents = this.data.bounceEvents.filter((e) => new Date(e.createdAt || 0).getTime() >= cutoff);
+    }
     this.store.saveThrottled(100);
     return before - this.data.logs.length;
   }

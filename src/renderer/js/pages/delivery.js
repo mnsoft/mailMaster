@@ -61,9 +61,11 @@
       view.innerHTML = `
         <div class="page-head">
           <div class="page-desc">
-            每一封推广邮件的投递结果都会在这里留痕：成功、失败（含原因）与硬退信。退信地址会被自动停用，避免持续无效投递影响发信信誉。
+            每一封推广邮件的投递结果都会在这里留痕：成功、失败（含原因）与硬退信。SMTP 即时返回的退信会打上标记并停用该地址；
+            服务器事后回执的退信由「退信监听」通过 IMAP 扫描收件箱自动识别，同样会从后续推广的发送列表中剔除。
           </div>
           <div class="page-actions">
+            <button class="btn" data-act="goto-bounce">退信监听</button>
             <button class="btn" data-act="retry-failed">重发本次失败项</button>
             <button class="btn" data-act="export">导出记录 CSV</button>
           </div>
@@ -246,6 +248,8 @@
         state.offset = state.items.length;
         fetchPage(true);
       };
+
+      view.querySelector('[data-act="goto-bounce"]').onclick = () => MM.navigate('bounce');
 
       view.querySelector('[data-act="export"]').onclick = async (e) => {
         const restore = MM.spinBtn(e.target, '导出中');

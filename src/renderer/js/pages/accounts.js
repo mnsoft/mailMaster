@@ -2,15 +2,15 @@
 (function () {
   const MM = window.MM;
 
-  /** 常用邮箱服务商快捷预设 */
+  /** 常用邮箱服务商快捷预设（同时带出对应的 IMAP 收件服务器，用于退信监听） */
   const SMTP_PRESETS = [
-    { label: '腾讯企业邮', host: 'smtp.exmail.qq.com', port: 465, secure: true, hint: '密码填写邮箱登录密码或客户端专用密码' },
-    { label: 'QQ 邮箱', host: 'smtp.qq.com', port: 465, secure: true, hint: '需在 QQ 邮箱设置中开启 SMTP 并使用授权码' },
-    { label: '网易企业邮', host: 'smtp.qiye.163.com', port: 465, secure: true, hint: '使用企业邮箱授权码' },
-    { label: '163 邮箱', host: 'smtp.163.com', port: 465, secure: true, hint: '需开启 SMTP 并使用授权码' },
-    { label: '阿里云企业邮', host: 'smtp.qiye.aliyun.com', port: 465, secure: true, hint: '使用邮箱密码' },
-    { label: 'Gmail', host: 'smtp.gmail.com', port: 465, secure: true, hint: '需使用应用专用密码（App Password）' },
-    { label: 'Outlook / Office365', host: 'smtp.office365.com', port: 587, secure: false, hint: 'STARTTLS，端口 587' },
+    { label: '腾讯企业邮', host: 'smtp.exmail.qq.com', port: 465, secure: true, imapHost: 'imap.exmail.qq.com', imapPort: 993, hint: '密码填写邮箱登录密码或客户端专用密码' },
+    { label: 'QQ 邮箱', host: 'smtp.qq.com', port: 465, secure: true, imapHost: 'imap.qq.com', imapPort: 993, hint: '需在 QQ 邮箱设置中开启 SMTP 并使用授权码' },
+    { label: '网易企业邮', host: 'smtp.qiye.163.com', port: 465, secure: true, imapHost: 'imap.qiye.163.com', imapPort: 993, hint: '使用企业邮箱授权码' },
+    { label: '163 邮箱', host: 'smtp.163.com', port: 465, secure: true, imapHost: 'imap.163.com', imapPort: 993, hint: '需开启 SMTP / IMAP 并使用授权码' },
+    { label: '阿里云企业邮', host: 'smtp.qiye.aliyun.com', port: 465, secure: true, imapHost: 'imap.qiye.aliyun.com', imapPort: 993, hint: '使用邮箱密码' },
+    { label: 'Gmail', host: 'smtp.gmail.com', port: 465, secure: true, imapHost: 'imap.gmail.com', imapPort: 993, hint: '需使用应用专用密码（App Password）' },
+    { label: 'Outlook / Office365', host: 'smtp.office365.com', port: 587, secure: false, imapHost: 'outlook.office365.com', imapPort: 993, hint: 'STARTTLS，端口 587' },
   ];
 
   const SMTP_WARNING = `⚠ 使用普通邮箱（企业邮 / QQ / 163 / Gmail 等）的 SMTP 群发推广邮件存在账号风险：
@@ -38,6 +38,13 @@
           ${providerBadge(a)}
           ${a.isDefault ? '<span class="badge badge-info">默认发信账号</span>' : ''}
           ${a.enabled === false ? '<span class="badge badge-paused">已停用</span>' : '<span class="badge badge-success">已启用</span>'}
+          ${
+            a.provider !== 'tencent-ses'
+              ? a.imap && a.imap.enabled
+                ? '<span class="badge badge-info" title="已开启 IMAP 退信监听，会自动扫描收件箱中的退信报告">退信监听已开</span>'
+                : '<span class="badge badge-draft" title="未开启 IMAP 退信监听">未开启退信监听</span>'
+              : ''
+          }
         </div>
         <div class="row-actions">
           <button class="btn btn-sm" data-act="test">测试连接</button>
@@ -60,7 +67,18 @@
                    <dt>密钥</dt><dd>${a.ses?.secretId && a.ses?.secretKey ? '••••••••（已配置）' : '<span style="color:var(--warn)">未配置 SecretId / SecretKey</span>'}</dd>`
                 : `<dt>SMTP 服务器</dt><dd class="mono" style="font-size:12px">${MM.esc(a.host)}:${MM.esc(a.port)}</dd>
                    <dt>加密方式</dt><dd>${a.secure !== false ? 'SSL / TLS' : 'STARTTLS'}</dd>
-                   <dt>密码/授权码</dt><dd>${a.pass ? '••••••••（已配置）' : '<span style="color:var(--warn)">未配置</span>'}</dd>`
+                   <dt>密码/授权码</dt><dd>${a.pass ? '••••••••（已配置）' : '<span style="color:var(--warn)">未配置</span>'}</dd>
+                   <dt>退信监听</dt><dd>${
+                     a.imap && a.imap.enabled
+                       ? `<span class="mono" style="font-size:12px">${MM.esc(a.imap.host || '未填写服务器')}:${MM.esc(a.imap.port || 993)}</span> · 收件箱 ${MM.esc(a.imap.mailbox || 'INBOX')}${
+                           a.imap.lastError
+                             ? `<div style="color:var(--danger);font-size:11.5px">上次错误：${MM.esc(a.imap.lastError)}</div>`
+                             : a.imap.lastCheckAt
+                               ? `<div style="color:var(--text-faint);font-size:11.5px">上次检查 ${MM.esc(MM.fmtDate(a.imap.lastCheckAt, true))} · 命中 ${a.imap.lastFound || 0} 条</div>`
+                               : '<div style="color:var(--text-faint);font-size:11.5px">尚未执行过检查</div>'
+                         }`
+                       : '<span style="color:var(--text-faint)">未开启（不会自动收录退信）</span>'
+                   }</dd>`
             }
             <dt>备注</dt><dd>${MM.esc(a.remark || '—')}</dd>
           </dl>
@@ -112,6 +130,52 @@
           <input class="input" type="password" data-role="pass" value="${MM.attr(acc.pass)}" placeholder="邮箱授权码（多数邮箱不是登录密码）" /></div>
       </div>
       <div class="callout danger" style="margin-bottom:12px">${MM.esc(SMTP_WARNING)}</div>`;
+  }
+
+  /**
+   * IMAP 退信监听配置
+   * 仅普通邮箱 SMTP 账号有意义 —— 需要有真实收件箱接收服务器投递的退信报告（DSN）
+   */
+  function imapFields(acc) {
+    const imap = acc.imap || {};
+    const enabled = imap.enabled === true;
+    const port = Number(imap.port) || (imap.secure === false ? 143 : 993);
+    return `
+      <div class="field" style="margin-bottom:12px">
+        <label class="switch"><input type="checkbox" data-role="imap-enabled" ${enabled ? 'checked' : ''} /><span class="track"></span>启用 IMAP 退信监听（自动扫描收件箱里的投递失败报告）</label>
+        <div class="field-hint">
+          开启后，应用会按「退信监听」页设定的轮询间隔登录该邮箱收件箱，识别退信报告并把对应地址从后续推广的发送列表中自动剔除，
+          直到你在「退信监听」页手动解除标记为止。
+        </div>
+      </div>
+      <div class="form-grid ${enabled ? '' : 'hidden'}" data-role="imap-fields">
+        <div class="field"><label class="field-label">IMAP 服务器</label>
+          <input class="input" data-role="imap-host" value="${MM.attr(imap.host)}" placeholder="imap.exmail.qq.com" /></div>
+        <div class="field"><label class="field-label">IMAP 端口</label>
+          <input class="input" type="number" data-role="imap-port" value="${MM.attr(port)}" /></div>
+        <div class="field"><label class="field-label">加密方式</label>
+          <select class="select" data-role="imap-secure">
+            <option value="true" ${imap.secure !== false ? 'selected' : ''}>SSL / TLS（推荐，常用 993）</option>
+            <option value="false" ${imap.secure === false ? 'selected' : ''}>明文 / STARTTLS（常用 143）</option>
+          </select></div>
+        <div class="field"><label class="field-label">登录名 <span class="field-hint">（留空则用发信邮箱地址）</span></label>
+          <input class="input" data-role="imap-user" value="${MM.attr(imap.user)}" placeholder="${MM.attr(acc.email || '')}" /></div>
+        <div class="field"><label class="field-label">IMAP 密码 / 授权码 <span class="field-hint">（留空则沿用发信密码）</span></label>
+          <input class="input" type="password" data-role="imap-pass" value="${MM.attr(imap.pass)}" placeholder="多数邮箱与发信授权码相同" /></div>
+        <div class="field"><label class="field-label">收件箱名称</label>
+          <input class="input" data-role="imap-mailbox" value="${MM.attr(imap.mailbox || 'INBOX')}" placeholder="INBOX" /></div>
+        <div class="field"><label class="field-label">每轮回溯天数</label>
+          <input class="input" type="number" min="1" max="365" data-role="imap-searchDays" value="${MM.attr(imap.searchDays || 30)}" />
+          <div class="field-hint">只检查最近这段时间内到达的邮件</div></div>
+        <div class="field">
+          <label class="switch"><input type="checkbox" data-role="imap-markSeen" ${imap.markSeen !== false ? 'checked' : ''} /><span class="track"></span>检查后把对应邮件标记为已读</label>
+          <label class="switch" style="margin-top:10px"><input type="checkbox" data-role="imap-allowInsecure" ${imap.allowInsecure === true ? 'checked' : ''} /><span class="track"></span>允许不加密连接（内网 / 自建邮件服务器）</label>
+        </div>
+      </div>
+      <div class="callout" style="margin-top:10px">
+        退信监听只读取收件箱中服务器自动生成的「投递失败通知」，不使用也不修改其他邮件内容；关闭「标记为已读」可以不改动邮箱状态。
+        多数邮箱需要先在网页版设置里<b>开启 IMAP 服务</b>，且部分邮箱（如 Gmail、163）要求使用客户端授权码而非登录密码。
+      </div>`;
   }
 
   function sesFields(acc) {
@@ -203,6 +267,18 @@
         </div>
       </div>
 
+      <div class="panel" style="margin-bottom:14px"><div class="panel-head"><div class="panel-title">④ 退信监听（IMAP）</div></div>
+        <div class="panel-body">
+          <div data-role="fields-imap-smtp" class="${provider === 'smtp' ? '' : 'hidden'}">${imapFields(acc)}</div>
+          <div data-role="fields-imap-ses" class="${provider === 'tencent-ses' ? '' : 'hidden'}">
+            <div class="callout warn" style="margin:0">
+              腾讯云邮件推送账号没有自己的收件箱，无法通过 IMAP 接收退信报告（腾讯云的退信会通过控制台与事件通知反馈）。
+              如果需要「自动监听退信并从发送列表剔除」，请再添加一个<b>普通邮箱 SMTP</b> 账号，并把推广邮件的退信地址指向它。
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div data-role="test-result"></div>`;
   }
 
@@ -224,6 +300,19 @@
         secure: ctx.$('[data-role="secure"]').value === 'true',
         pass: ctx.$('[data-role="pass"]').value,
         user: base.email,
+        // IMAP 退信监听配置（随账号一并保存）
+        imap: {
+          enabled: ctx.$('[data-role="imap-enabled"]').checked,
+          host: ctx.$('[data-role="imap-host"]').value.trim(),
+          port: Number(ctx.$('[data-role="imap-port"]').value) || (ctx.$('[data-role="imap-secure"]').value === 'true' ? 993 : 143),
+          secure: ctx.$('[data-role="imap-secure"]').value === 'true',
+          user: ctx.$('[data-role="imap-user"]').value.trim(),
+          pass: ctx.$('[data-role="imap-pass"]').value,
+          mailbox: ctx.$('[data-role="imap-mailbox"]').value.trim() || 'INBOX',
+          searchDays: Number(ctx.$('[data-role="imap-searchDays"]').value) || 30,
+          markSeen: ctx.$('[data-role="imap-markSeen"]').checked,
+          allowInsecure: ctx.$('[data-role="imap-allowInsecure"]').checked,
+        },
       });
     }
     return Object.assign(base, {
@@ -252,7 +341,7 @@
       title: account ? `编辑发信账号：${account.email}` : '新增发信账号',
       size: 'wide',
       body: accountForm(account),
-      footer: `<button class="btn" data-cancel>取消</button><button class="btn" data-test>测试连接</button><button class="btn btn-primary" data-save>保存账号</button>`,
+      footer: `<button class="btn" data-cancel>取消</button><button class="btn" data-test>测试发信连接</button><button class="btn" data-test-imap>测试 IMAP 收信</button><button class="btn btn-primary" data-save>保存账号</button>`,
     });
 
     if (account && account.id) ctx.$('[data-role="email"]').dataset.id = account.id;
@@ -263,12 +352,23 @@
       ctx.$$('[data-role="provider"] button').forEach((b) => b.classList.toggle('active', b.dataset.provider === provider));
       ctx.$('[data-role="fields-smtp"]').classList.toggle('hidden', provider !== 'smtp');
       ctx.$('[data-role="fields-ses"]').classList.toggle('hidden', provider !== 'tencent-ses');
+      ctx.$('[data-role="fields-imap-smtp"]').classList.toggle('hidden', provider !== 'smtp');
+      ctx.$('[data-role="fields-imap-ses"]').classList.toggle('hidden', provider !== 'tencent-ses');
       ctx.$('[data-role="provider-hint"]').innerHTML =
         provider === 'smtp'
-          ? '使用自有邮箱账号通过 SMTP 协议发送。配置简单，但群发推广存在被服务商限速 / 封号的风险，请控制发送频率与名单质量。'
+          ? '使用自有邮箱账号通过 SMTP 协议发送。配置简单，但群发推广存在被服务商限速 / 封号的风险，请控制发送频率与名单质量；同时可开启下方的 IMAP 退信监听。'
           : '使用腾讯云邮件推送（SES）通道发送，送达率更高、具备免费额度与合规退订机制；需要腾讯云账号的 SecretId / SecretKey 与已审核的发信模板（或发信域名 / 地址）。';
     };
     paintProvider();
+
+    /** 启用 IMAP 开关控制详细字段的显隐 */
+    const imapSwitch = ctx.$('[data-role="imap-enabled"]');
+    const imapFieldBox = ctx.$('[data-role="imap-fields"]');
+    const paintImap = () => {
+      if (imapSwitch && imapFieldBox) imapFieldBox.classList.toggle('hidden', !imapSwitch.checked);
+    };
+    if (imapSwitch) imapSwitch.onchange = paintImap;
+    paintImap();
 
     ctx.$$('[data-role="provider"] button').forEach((btn) => {
       btn.onclick = () => {
@@ -283,7 +383,16 @@
         ctx.$('[data-role="host"]').value = p.host;
         ctx.$('[data-role="port"]').value = p.port;
         ctx.$('[data-role="secure"]').value = String(p.secure);
-        ctx.$('[data-role="preset-hint"]').textContent = `${p.label}：${p.hint}（服务器 ${p.host}）`;
+        ctx.$('[data-role="preset-hint"]').textContent = `${p.label}：${p.hint}（发信服务器 ${p.host}${p.imapHost ? ` · 收信服务器 ${p.imapHost}` : ''}）`;
+        // 顺带带出 IMAP 收信服务器（仅在用户尚未填写时填充，避免覆盖已有配置）
+        const imapHost = ctx.$('[data-role="imap-host"]');
+        if (imapHost && !imapHost.value && p.imapHost) {
+          imapHost.value = p.imapHost;
+          const imapPort = ctx.$('[data-role="imap-port"]');
+          if (imapPort) imapPort.value = p.imapPort || 993;
+          const imapSecure = ctx.$('[data-role="imap-secure"]');
+          if (imapSecure) imapSecure.value = 'true';
+        }
       };
     });
 
@@ -306,9 +415,45 @@
       MM.toast(`${d.ok ? '✓' : '✕'} ${d.message}`, d.ok ? 'success' : 'error', 8000);
     };
 
+    ctx.$('[data-test-imap]').onclick = async (e) => {
+      const data = collect(ctx, provider);
+      const box = ctx.$('[data-role="test-result"]');
+      if (provider !== 'smtp') {
+        MM.toast('腾讯云邮件推送账号没有收件箱，无法配置 IMAP 退信监听', 'warn', 7000);
+        return;
+      }
+      if (!data.imap.enabled) {
+        MM.toast('请先勾选「启用 IMAP 退信监听」再测试', 'warn');
+        return;
+      }
+      if (!data.imap.host) {
+        MM.toast('请先填写 IMAP 服务器地址', 'warn');
+        return;
+      }
+      // 未保存的新账号也要能测试：把当前表单的 IMAP 配置原样传给主进程
+      const restore = MM.spinBtn(e.target, '连接中');
+      const res = await MM.api.testImap({
+        id: account && account.id ? account.id : undefined,
+        draft: { email: data.email, pass: data.pass, user: data.user, imap: data.imap },
+      });
+      restore();
+      if (!res.ok) {
+        box.innerHTML = `<div class="callout danger">IMAP 测试失败：${MM.esc(res.error)}</div>`;
+        return;
+      }
+      const d = res.data;
+      box.innerHTML = `<div class="callout ${d.ok ? '' : 'danger'}">${d.ok ? '✓' : '✕'} IMAP：${MM.esc(d.message)}（耗时 ${d.durationMs} ms）</div>`;
+      MM.toast(`IMAP ${d.ok ? '✓' : '✕'} ${d.message}`, d.ok ? 'success' : 'error', 9000);
+    };
+
     ctx.$('[data-save]').onclick = async (e) => {
+      const data = collect(ctx, provider);
+      if (provider === 'smtp' && data.imap && data.imap.enabled && !data.imap.host) {
+        MM.toast('已勾选启用 IMAP 退信监听，请先填写 IMAP 服务器地址（或取消勾选）', 'warn', 7000);
+        return;
+      }
       const restore = MM.spinBtn(e.target, '保存中');
-      const res = await MM.api.saveAccount(collect(ctx, provider));
+      const res = await MM.api.saveAccount(data);
       restore();
       if (!res.ok) {
         MM.toast(res.error, 'error', 7000);
@@ -392,6 +537,8 @@
       const sesAccounts = accounts.filter((a) => a.provider === 'tencent-ses');
       const unconfigured = accounts.filter((a) => (a.provider === 'tencent-ses' ? !(a.ses?.secretId && a.ses?.secretKey) : !a.pass));
       const sesFreeLeft = sesAccounts.length ? sesAccounts.reduce((n, a) => n + (a.freeQuotaRemaining || 0), 0) : null;
+      const imapReady = smtpAccounts.filter((a) => a.imap?.enabled && a.imap?.host);
+      const imapConfigured = smtpAccounts.filter((a) => a.imap?.enabled);
 
       view.innerHTML = `
         <div class="page-head">
@@ -400,6 +547,7 @@
             <b>腾讯云邮件推送 SES</b>（专业发信通道，送达率更高，自带免费额度）。可添加多个账号，为不同推广任务指定不同发信地址。
           </div>
           <div class="page-actions">
+            <button class="btn" data-act="goto-bounce">退信监听</button>
             <button class="btn" data-act="goto-settings">其他设置</button>
             <button class="btn btn-primary" data-act="create">＋ 新增发信账号</button>
           </div>
@@ -431,6 +579,20 @@
             : ''
         }
 
+        ${
+          smtpAccounts.length === 0
+            ? ''
+            : imapReady.length
+              ? `<div class="callout">退信监听：<b>${imapReady.length}</b> 个账号已开启 IMAP 自动监听（${imapReady.map((a) => MM.esc(a.email)).join('、')}），退信地址会被自动标记并从后续推广的发送列表中剔除。
+                   ${
+                     imapConfigured.length > imapReady.length
+                       ? `<br/><span style="color:var(--warn)">另有 ${imapConfigured.length - imapReady.length} 个账号勾选了退信监听但未填写 IMAP 服务器，请补全后再启用。</span>`
+                       : ''
+                   }
+                   可前往 <a href="#/bounce" style="color:var(--accent)">退信监听</a> 页查看监听状态、退信事件与解除标记。</div>`
+              : `<div class="callout warn">尚未开启 IMAP 退信监听：普通邮箱 SMTP 账号可在「编辑」中打开「退信监听（IMAP）」，然后由应用自动扫描收件箱里的退信报告并把无效地址从发送列表中剔除。</div>`
+        }
+
         <div data-role="list">
           ${accounts.length ? accounts.map(accountCard).join('') : '<div class="empty"><strong>还没有配置发信账号</strong>点击右上角「新增发信账号」添加第一个用于群发推广的通道。</div>'}
         </div>
@@ -438,6 +600,7 @@
 
       const reload = () => MM.renderRoute('accounts');
       view.querySelector('[data-act="goto-settings"]').onclick = () => MM.navigate('settings');
+      view.querySelector('[data-act="goto-bounce"]').onclick = () => MM.navigate('bounce');
       view.querySelector('[data-act="create"]').onclick = () => openEditor(null, reload);
 
       view.querySelectorAll('[data-id]').forEach((card) => {

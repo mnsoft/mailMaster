@@ -11,6 +11,7 @@ const { Database } = require('./db');
 const { CampaignRunner } = require('./engine');
 const { Scheduler } = require('./scheduler');
 const { IpcBridge } = require('./ipc');
+const { BounceWatcher } = require('./bounce-watcher');
 
 const isDev = process.argv.includes('--dev');
 
@@ -29,6 +30,7 @@ let db = null;
 let runner = null;
 let scheduler = null;
 let bridge = null;
+let bounceWatcher = null;
 
 const DAY_MS = 24 * 3600 * 1000;
 
@@ -144,12 +146,21 @@ app.whenReady().then(() => {
 
   scheduler = new Scheduler(db, (campaign, reason) => runner.runCampaign(campaign.id, { reason }), push);
 
-  bridge = new IpcBridge({ db, runner, scheduler, getWindow: () => mainWindow });
+  // IMAP 退信监听：定时轮询收件箱，自动标记退信地址并从发送列表剔除
+  bounceWatcher = new BounceWatcher(db, push);
+
+  bridge = new IpcBridge({ db, runner, scheduler, bounceWatcher, getWindow: () => mainWindow });
   bridge.register();
 
   createWindow();
   createTray();
   scheduler.start();
+  bounceWatcher.start();
+  // 启动后延迟 20 秒做一次退信检查，避免与界面首屏加载抢资源
+  setTimeout(() => {
+    if (!db.getSettings().imapAutoCheck) return;
+    bounceWatcher.checkNow({ reason: 'startup' }).catch((err) => console.error('[bounce] 启动检查失败', err.message));
+  }, 20000).unref();
 
   // 每日 0 点后按天重置的配额依赖日志按日统计，无需额外定时；这里做一次数据自检
   setInterval(() => {
@@ -182,6 +193,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   if (scheduler) scheduler.stop();
+  if (bounceWatcher) bounceWatcher.stop();
   if (db) db.flush();
 });
 

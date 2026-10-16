@@ -3,16 +3,25 @@
 /**
  * 逻辑自测（无需 Electron / SMTP）：
  *   node test/run-tests.js
- * 覆盖：模板变量编译、调度时间计算、数据层 CRUD 与统计、CSV 导入、错误归类、试运行全流程。
+ * 覆盖：模板变量编译与 Spintax、调度时间计算、发送节奏、多账号轮询、数据层 CRUD 与统计、
+ *      CSV 导入、错误归类、试运行全流程、MIME/DSN 退信解析、IMAP 协议与退信监听闭环。
  */
 
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 const path = require('path');
+const vm = require('vm');
 
 const { Database, LOG_STATUS, parseCsv } = require('../src/main/db');
 const template = require('../src/main/template');
+const spintax = require('../src/main/spintax');
+const pacing = require('../src/main/pacing');
+const { AccountPool, resolvePoolAccounts } = require('../src/main/account-pool');
+const mime = require('../src/main/mime');
+const { ImapClient } = require('../src/main/imap');
+const { BounceWatcher } = require('../src/main/bounce-watcher');
 const { scheduleNextRun, describeSchedule } = require('../src/main/scheduler');
 const mailer = require('../src/main/mailer');
 const tencentSes = require('../src/main/tencent-ses');
@@ -210,7 +219,13 @@ test('投递结果会累加到联系人统计', () => {
   db.applyContactResult(c.id, LOG_STATUS.BOUNCED);
   assert.strictEqual(c.stats.success, before.success + 1);
   assert.strictEqual(c.stats.bounced, before.bounced + 1);
-  assert.strictEqual(c.subscribed, false, '硬退信应自动停用该地址');
+  // 硬退信改为打「退信标记」（可手动解除），不再直接把联系人置为退订
+  assert.strictEqual(c.bounceMarked, true, '硬退信应打上退信标记');
+  assert.ok(c.bounceInfo && c.bounceInfo.at, '退信标记应带时间与原因');
+  assert.strictEqual(db.resolveAudience({ mode: 'all' }).some((x) => x.id === c.id), false, '退信标记的地址不应再进入发送列表');
+  db.releaseContactBounce(c.id);
+  assert.strictEqual(c.bounceMarked, false, '解除标记后应恢复可发送');
+  assert.strictEqual(db.resolveAudience({ mode: 'all' }).some((x) => x.id === c.id), true);
   c.subscribed = true;
 });
 test('总览统计口径正确', () => {
@@ -435,7 +450,12 @@ console.log('\n[7] 试运行全流程（不连接 SMTP）');
 
   await testAsync('执行推广任务并逐封记录投递结果', async () => {
     const progress = await runner.runCampaign(campaign.id, { reason: 'manual' });
-    assert.strictEqual(progress.total, db2.data.contacts.filter((c) => c.subscribed !== false).length);
+    const audience = db2.resolveAudience(campaign.audience);
+    assert.strictEqual(progress.total, audience.length);
+    assert.ok(
+      progress.total < db2.data.contacts.filter((c) => c.subscribed !== false).length,
+      '打了退信标记的地址应被排除在发送列表之外',
+    );
     assert.strictEqual(progress.done, progress.total);
     assert.strictEqual(progress.success + progress.failed + progress.bounced, progress.total);
     assert.strictEqual(campaign.runCount, 1);
@@ -472,6 +492,696 @@ console.log('\n[7] 试运行全流程（不连接 SMTP）');
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(dir2, { recursive: true, force: true });
 
+  await runSpintaxTests();
+  runPacingTests();
+  runPoolTests();
+  runMimeTests();
+  await runBounceTests();
+  await runPreviewMockTests();
+
   console.log(`\n测试结果：通过 ${passed} 项，失败 ${failed} 项\n`);
   process.exit(failed ? 1 : 0);
 })();
+
+// ---------------------------------------------------------------------------
+// [8] Spintax 同义词轮换
+// ---------------------------------------------------------------------------
+async function runSpintaxTests() {
+  console.log('\n[8] Spintax 同义词轮换');
+
+  test('只有含顶层 | 的大括号组才被当作 Spintax', () => {
+    assert.strictEqual(spintax.expand('正常写 {} 或 {单个}').text, '正常写 {} 或 {单个}');
+    assert.strictEqual(spintax.countVariants('正常写 {} 或 {单个}'), 1);
+  });
+
+  test('选项组组合数按乘积计算（含嵌套）', () => {
+    assert.strictEqual(spintax.countVariants('{A|B}'), 2);
+    assert.strictEqual(spintax.countVariants('{A|B}{C|D|E}'), 6);
+    assert.strictEqual(spintax.countVariants('{A|{B1|B2}}'), 3);
+  });
+
+  test('反斜杠可输出字面大括号', () => {
+    assert.strictEqual(spintax.expand('\\{a|b\\}').text, '{a|b}');
+  });
+
+  test('展开结果始终落在选项集合内', () => {
+    const out = new Set();
+    for (let i = 0; i < 60; i += 1) out.add(spintax.expand('{您好|你好|打扰了}').text);
+    assert.deepStrictEqual([...out].sort(), ['你好', '打扰了', '您好'].sort());
+  });
+
+  test('展开器优先选用本批次没用过的组合', () => {
+    const used = new Set();
+    const seen = new Set();
+    for (let i = 0; i < 6; i += 1) {
+      seen.add(spintax.expand('{A|B|C}{D|E}', { used }).text);
+    }
+    assert.strictEqual(seen.size, 6, '6 次展开在 6 种组合下应互不相同');
+  });
+
+  test('与 {{变量}} 语法不冲突', () => {
+    const r = template.render('{您好|你好}{{联系人}}，{{公司名}}在{{城市}}。', {
+      company: '云图',
+      contact: '张明远',
+      city: '深圳',
+    });
+    assert.ok(/^(您好|你好)张明远，云图在深圳。$/.test(r.text), `实际输出：${r.text}`);
+  });
+
+  test('变量本身带花括号也不会被 Spintax 吞掉', () => {
+    const r = template.render('{{{公司名}}|客户}', { company: '云图' });
+    assert.ok(['云图', '客户'].includes(r.text), `实际输出：${r.text}`);
+  });
+
+  test('同一批次内主题与正文字面各不相同', () => {
+    const tpl = { subject: '{{公司名}} · {关于|聊聊}{沟通|交流}', body: '{您好|你好|打扰了}，{方案|资料}已更新。' };
+    const used = new Set();
+    const pairs = new Set();
+    for (let i = 0; i < 12; i += 1) {
+      const r = template.renderMessage(tpl, { company: '云图' }, template.buildGlobalContext({ index: i + 1 }), {
+        spintax: { used },
+      });
+      pairs.add(`${r.subject}|${r.body}`);
+    }
+    assert.strictEqual(pairs.size, 12, '12 封邮件应覆盖全部 4×3 种组合且互不重复');
+    assert.strictEqual(used.size, 12);
+  });
+
+  test('组合用尽后开启新一轮，不会死循环也不会报错', () => {
+    const used = new Set();
+    for (let i = 0; i < 5; i += 1) {
+      const r = spintax.expand('{A|B}', { used });
+      assert.ok(['A', 'B'].includes(r.text));
+    }
+    assert.ok(used.size <= 2, '两轮之后应重新计数');
+  });
+
+  test('describeSpintax 报告变体总数', () => {
+    const info = template.describeSpintax({ subject: '{a|b}', body: '{c|d|e}' });
+    assert.strictEqual(info.hasSpintax, true);
+    assert.strictEqual(info.subjectVariants, 2);
+    assert.strictEqual(info.bodyVariants, 3);
+    assert.strictEqual(info.totalVariants, 6);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// [9] 发送节奏：随机延迟与速率
+// ---------------------------------------------------------------------------
+function runPacingTests() {
+  console.log('\n[9] 发送节奏（随机延迟 / 速率控制）');
+
+  test('旧配置（只有 intervalSeconds）按固定间隔处理', () => {
+    const cfg = pacing.normalize({ intervalSeconds: 6, dailyLimit: 200, maxRetries: 1 });
+    assert.strictEqual(cfg.mode, 'fixed');
+    assert.strictEqual(cfg.intervalSeconds, 6);
+    assert.strictEqual(pacing.nextDelay(cfg, { sentCount: 1 }).ms, 6000);
+  });
+
+  test('随机延迟始终落在配置区间内', () => {
+    const cfg = pacing.normalize({ mode: 'random', delayMinSeconds: 20, delayMaxSeconds: 90 });
+    for (let i = 0; i < 300; i += 1) {
+      const { ms, kind } = pacing.nextDelay(cfg, { sentCount: 1 });
+      assert.strictEqual(kind, 'random');
+      assert.ok(ms >= 20000 && ms <= 90000, `延迟越界：${ms}`);
+    }
+  });
+
+  test('每 N 封后插入一次长停顿', () => {
+    const cfg = pacing.normalize({
+      mode: 'random',
+      delayMinSeconds: 20,
+      delayMaxSeconds: 90,
+      burstEvery: 5,
+      burstMinSeconds: 180,
+      burstMaxSeconds: 420,
+    });
+    assert.strictEqual(pacing.nextDelay(cfg, { sentCount: 5 }).kind, 'burst');
+    assert.strictEqual(pacing.nextDelay(cfg, { sentCount: 10 }).kind, 'burst');
+    assert.strictEqual(pacing.nextDelay(cfg, { sentCount: 3 }).kind, 'random');
+    const burst = pacing.nextDelay(cfg, { sentCount: 5 }).ms;
+    assert.ok(burst >= 180000 && burst <= 420000);
+  });
+
+  test('区间填反时自动纠正，避免死等或负数', () => {
+    const cfg = pacing.normalize({ mode: 'random', delayMinSeconds: 90, delayMaxSeconds: 20 });
+    assert.strictEqual(cfg.delayMinSeconds, 90);
+    assert.strictEqual(cfg.delayMaxSeconds, 90);
+  });
+
+  test('每小时上限：窗口内未满不等待，满了等到最早一封滑出', () => {
+    const now = Date.now();
+    const stamps = [now - 10 * 60 * 1000, now - 5 * 60 * 1000];
+    assert.strictEqual(pacing.waitForHourlySlot(stamps, 5, now), 0);
+    const wait = pacing.waitForHourlySlot(stamps, 2, now);
+    assert.ok(wait > 0 && wait <= 3600 * 1000, `等待时长异常：${wait}`);
+  });
+
+  test('整批耗时估算随总数增长并给出人话描述', () => {
+    const cfg = pacing.normalize({ mode: 'random', delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 10 });
+    const small = pacing.estimateMs(cfg, 5);
+    const large = pacing.estimateMs(cfg, 100);
+    assert.ok(large > small);
+    assert.ok(pacing.humanizeMs(large).startsWith('约'));
+    assert.ok(pacing.describe(cfg).includes('随机延迟'));
+  });
+
+  test('预设节奏齐全且都能被归一化', () => {
+    assert.ok(pacing.PRESETS.length >= 3);
+    for (const preset of pacing.PRESETS) {
+      const cfg = pacing.normalize(preset.config);
+      assert.ok(cfg.mode === 'random' || cfg.mode === 'fixed');
+      assert.ok(cfg.delayMaxSeconds >= cfg.delayMinSeconds);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// [10] 多账号轮询
+// ---------------------------------------------------------------------------
+function runPoolTests() {
+  console.log('\n[10] 多账号轮询发送');
+
+  const accounts = [
+    { id: 'a1', email: 'a1@example.com', enabled: true, dailyLimit: 2 },
+    { id: 'a2', email: 'a2@example.com', enabled: true, dailyLimit: 100 },
+    { id: 'a3', email: 'a3@example.com', enabled: false, dailyLimit: 100 },
+  ];
+
+  test('轮询按顺序依次使用各个账号', () => {
+    const pool = new AccountPool(accounts, { strategy: 'roundRobin' });
+    const picked = [];
+    for (let i = 0; i < 6; i += 1) {
+      const { account } = pool.next((a) => (a.enabled === false ? '停用' : null));
+      picked.push(account.email);
+      pool.markUsed(account.id);
+    }
+    assert.deepStrictEqual(picked, ['a1@example.com', 'a2@example.com', 'a1@example.com', 'a2@example.com', 'a1@example.com', 'a2@example.com']);
+  });
+
+  test('达到日限额的账号会被自动跳过', () => {
+    const pool = new AccountPool(accounts, { strategy: 'roundRobin' });
+    // a1 日限额 2 封，先发 1 封，第 2 封用尽后应自动切到 a2
+    const usage = { 'a1@example.com': 1, 'a2@example.com': 0 };
+    const picked = [];
+    for (let i = 0; i < 4; i += 1) {
+      const { account } = pool.next((a) => {
+        if (a.enabled === false) return '停用';
+        if (usage[a.email] >= a.dailyLimit) return '今日已达上限';
+        return null;
+      });
+      picked.push(account.email);
+      usage[account.email] += 1;
+    }
+    assert.deepStrictEqual(picked, ['a1@example.com', 'a2@example.com', 'a2@example.com', 'a2@example.com']);
+  });
+
+  test('全部不可用时返回 null 并说明每个账号的原因', () => {
+    const pool = new AccountPool(accounts, { strategy: 'roundRobin' });
+    const res = pool.next((a) => (a.enabled === false ? '账号已停用' : '今日已达上限'));
+    assert.strictEqual(res.account, null);
+    assert.strictEqual(res.blocked.length, 3);
+    assert.ok(res.blocked.every((b) => b.reason));
+  });
+
+  test('分布统计反映各账号实际发送量', () => {
+    const pool = new AccountPool(accounts.slice(0, 2), { strategy: 'roundRobin' });
+    pool.markUsed('a1');
+    pool.markUsed('a1');
+    pool.markUsed('a2');
+    const dist = pool.distribution();
+    assert.deepStrictEqual(dist.map((d) => d.sent), [2, 1]);
+  });
+
+  test('单账号模式沿用原有解析规则，池模式按勾选顺序', () => {
+    const all = accounts;
+    const single = resolvePoolAccounts({ accountId: 'a2', accountMode: 'single' }, all, (id) => all.find((a) => a.id === id));
+    assert.deepStrictEqual(single.map((a) => a.id), ['a2']);
+    const pool = resolvePoolAccounts({ accountMode: 'pool', accountIds: ['a2', 'a1'] }, all, () => all[0]);
+    assert.deepStrictEqual(pool.map((a) => a.id), ['a2', 'a1']);
+  });
+
+  test('池模式只勾选一个账号时回落为单账号', () => {
+    const db3 = new Database();
+    const d = tmpDir();
+    db3.init(d);
+    const saved = db3.saveCampaign({ name: '回落用例', accountMode: 'pool', accountIds: [db3.listAccounts()[0].id] });
+    assert.strictEqual(saved.accountMode, 'single');
+    fs.rmSync(d, { recursive: true, force: true });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// [11] MIME / DSN 退信解析
+// ---------------------------------------------------------------------------
+const SAMPLE_DSN = [
+  'Return-Path: <MAILER-DAEMON@example.com>',
+  'From: Mail Delivery System <MAILER-DAEMON@example.com>',
+  'To: marketing@example.com',
+  'Subject: =?utf-8?B?VW5kZWxpdmVyZWQgTWFpbCBSZXR1cm5lZCB0byBTZW5kZXI=?=',
+  'Date: Tue, 13 Oct 2026 09:12:03 +0800',
+  'Message-ID: <dsn-1@example.com>',
+  'Content-Type: multipart/report; report-type=delivery-status;\r\n boundary="BND1"',
+  '',
+  '--BND1',
+  'Content-Type: text/plain; charset=utf-8',
+  'Content-Transfer-Encoding: quoted-printable',
+  '',
+  'I am sorry to inform you that your message could not be delivered.',
+  '=E6=8A=95=E9=80=92=E5=A4=B1=E8=B4=A5',
+  '    550 5.1.1 <zhangmingyuan@yuntu-ai.com>: Recipient address rejected:',
+  '    User unknown in local recipient table',
+  '',
+  '--BND1',
+  'Content-Type: message/delivery-status',
+  '',
+  'Final-Recipient: rfc822; zhangmingyuan@yuntu-ai.com',
+  'Action: failed',
+  'Status: 5.1.1',
+  'Diagnostic-Code: smtp; 550 5.1.1 Recipient address rejected: User unknown',
+  'Original-Message-ID: <dryrun-9f2a1b@mailmaster.local>',
+  '',
+  '--BND1',
+  'Content-Type: message/rfc822',
+  '',
+  'Message-ID: <dryrun-9f2a1b@mailmaster.local>',
+  'To: zhangmingyuan@yuntu-ai.com',
+  '',
+  'body',
+  '--BND1--',
+  '',
+].join('\r\n');
+
+function runMimeTests() {
+  console.log('\n[11] MIME / DSN 退信解析');
+
+  const node = mime.parseMessage(Buffer.from(SAMPLE_DSN, 'utf8'));
+  const bounce = mime.extractBounce(node);
+
+  test('multipart/report 被递归拆成三个子部件', () => {
+    assert.strictEqual(node.contentType.type, 'multipart/report');
+    assert.strictEqual(node.contentType.params['report-type'], 'delivery-status');
+    assert.deepStrictEqual(node.parts.map((p) => p.contentType.type), ['text/plain', 'message/delivery-status', 'message/rfc822']);
+  });
+
+  test('RFC 2047 编码字主题被正确解码', () => {
+    assert.strictEqual(bounce.subject, 'Undelivered Mail Returned to Sender');
+  });
+
+  test('quoted-printable 中文正文被正确解码', () => {
+    assert.ok(bounce.text.includes('投递失败'), '中文应已解码');
+  });
+
+  test('识别为硬退信并给出状态码与收件人', () => {
+    assert.strictEqual(bounce.isBounce, true);
+    assert.strictEqual(bounce.type, 'hard');
+    assert.strictEqual(bounce.status, '5.1.1');
+    assert.deepStrictEqual(bounce.recipients, ['zhangmingyuan@yuntu-ai.com']);
+    assert.strictEqual(bounce.originalMessageId, 'dryrun-9f2a1b@mailmaster.local');
+    assert.ok(bounce.diagnostic.includes('User unknown'));
+  });
+
+  test('4.x 状态码归为临时性退信（不标记）', () => {
+    const soft = SAMPLE_DSN.replace('Status: 5.1.1', 'Status: 4.2.2').replace('Action: failed', 'Action: delayed');
+    const info = mime.extractBounce(mime.parseMessage(Buffer.from(soft, 'utf8')));
+    assert.strictEqual(info.type, 'soft');
+  });
+
+  test('普通邮件不会被误判为退信', () => {
+    const normal = ['From: zhang@yuntu.com', 'Subject: 关于方案的沟通', 'Content-Type: text/plain', '', '您好，方案已发送。'].join('\r\n');
+    const info = mime.extractBounce(mime.parseMessage(Buffer.from(normal, 'utf8')));
+    assert.strictEqual(info.isBounce, false);
+  });
+
+  test('中文退信主题也会被识别', () => {
+    const cn = ['From: postmaster@example.com', 'Subject: 退信通知：无法投递', 'Content-Type: text/plain', '', '您的邮件无法投递，收件人 x@y.com 不存在。'].join('\r\n');
+    const info = mime.extractBounce(mime.parseMessage(Buffer.from(cn, 'utf8')));
+    assert.strictEqual(info.isBounce, true);
+    assert.ok(info.recipients.includes('x@y.com'));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// [12] IMAP 协议 + 退信监听闭环（对着本地模拟 IMAP 服务器跑）
+// ---------------------------------------------------------------------------
+function startFakeImapServer() {
+  const state = { commands: [], fetched: 0 };
+  const server = net.createServer((socket) => {
+    socket.write('* OK [CAPABILITY IMAP4rev1] fake ready\r\n');
+    let buf = '';
+    socket.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      for (;;) {
+        const idx = buf.indexOf('\r\n');
+        if (idx < 0) break;
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        state.commands.push(line);
+        const tag = line.split(' ')[0];
+        if (/LOGIN/i.test(line)) socket.write(`${tag} OK LOGIN completed\r\n`);
+        else if (/CAPABILITY/i.test(line)) socket.write(`* CAPABILITY IMAP4rev1\r\n${tag} OK done\r\n`);
+        else if (/SELECT/i.test(line)) socket.write(`* 3 EXISTS\r\n${tag} OK [READ-WRITE] done\r\n`);
+        else if (/UID SEARCH/i.test(line)) socket.write(`* SEARCH 101 102\r\n${tag} OK done\r\n`);
+        else if (/UID FETCH/i.test(line)) {
+          state.fetched += 1;
+          const uid = (line.match(/UID FETCH (\d+)/) || [])[1];
+          // 只有 101 是退信报告；102 是普通邮件，用于验证不会被误判
+          const payload =
+            uid === '101'
+              ? SAMPLE_DSN
+              : ['From: partner@yuntu-ai.com', 'Subject: 方案已收到，谢谢', 'Content-Type: text/plain; charset=utf-8', '', '已收到，稍后回复。'].join('\r\n');
+          const body = Buffer.from(payload, 'utf8');
+          socket.write(`* ${uid} FETCH (BODY[] {${body.length}}\r\n`);
+          socket.write(body);
+          socket.write(')\r\n');
+          socket.write(`${tag} OK done\r\n`);
+        } else if (/UID STORE/i.test(line)) socket.write(`* 101 FETCH (FLAGS (\\Seen))\r\n${tag} OK done\r\n`);
+        else if (/LOGOUT/i.test(line)) {
+          socket.write(`* BYE bye\r\n${tag} OK done\r\n`);
+          socket.end();
+        } else socket.write(`${tag} BAD unknown\r\n`);
+      }
+    });
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, state, port: server.address().port })));
+}
+
+async function runBounceTests() {
+  console.log('\n[12] IMAP 退信监听（本地模拟服务器）');
+
+  const { server, state, port } = await startFakeImapServer();
+
+  await testAsync('IMAP 客户端完成 连接 → 登录 → 选择邮箱 → 搜索 → 取信 → 标记已读', async () => {
+    const client = new ImapClient({ host: '127.0.0.1', port, secure: false });
+    await client.connect();
+    await client.login();
+    const box = await client.select('INBOX');
+    const uids = await client.search(['UNSEEN', 'SINCE 12-Oct-2026']);
+    const raw = await client.fetchRaw(uids[0]);
+    const seen = await client.markSeen(uids[0]);
+    await client.logout();
+    assert.strictEqual(box.exists, 3);
+    assert.deepStrictEqual(uids, [101, 102]);
+    assert.strictEqual(raw.length, Buffer.byteLength(SAMPLE_DSN, 'utf8'), '字面量应按长度精确读取');
+    assert.strictEqual(seen, true);
+    assert.ok(state.commands.some((c) => /UID FETCH 101 \(BODY\.PEEK\[\]\)/.test(c)));
+    assert.ok(state.commands.some((c) => /UID STORE 101 \+FLAGS/.test(c)));
+  });
+
+  await testAsync('退信监听到 DSN 后自动标记联系人并从发送列表剔除', async () => {
+    const d = tmpDir();
+    const db4 = new Database();
+    db4.init(d);
+    db4.getSettings().sendMode = 'dryRun';
+
+    const account = db4.listAccounts()[0];
+    account.imap = { enabled: true, host: '127.0.0.1', port, secure: false, user: 'u', pass: 'p', mailbox: 'INBOX', markSeen: true, searchDays: 30, allowInsecure: true };
+
+    // 造一条投递成功的日志，其 messageId 与 DSN 里的 Original-Message-ID 对应
+    const contact = db4.data.contacts[0];
+    contact.email = 'zhangmingyuan@yuntu-ai.com';
+    db4.addLog({
+      campaignId: db4.listCampaigns()[0].id,
+      campaignName: '退信用例',
+      accountId: account.id,
+      accountEmail: account.email,
+      contactId: contact.id,
+      company: contact.company,
+      contact: contact.contact,
+      email: contact.email,
+      subject: '测试主题',
+      status: LOG_STATUS.SUCCESS,
+      messageId: 'dryrun-9f2a1b@mailmaster.local',
+      dryRun: false,
+    });
+
+    const watcher = new BounceWatcher(db4, () => {});
+    const summary = await watcher.checkNow({ reason: 'manual' });
+    assert.strictEqual(summary.marked, 1, '应标记 1 个退信地址');
+    assert.strictEqual(contact.bounceMarked, true);
+    assert.strictEqual(contact.bounceInfo.type, 'hard');
+    assert.ok(contact.bounceInfo.reason.includes('5.1.1'));
+    assert.strictEqual(
+      db4.resolveAudience({ mode: 'all' }).some((c) => c.id === contact.id),
+      false,
+      '退信地址不应再进入发送列表',
+    );
+
+    const events = db4.listBounceEvents({});
+    assert.strictEqual(events.total, 1);
+    assert.strictEqual(events.items[0].email, 'zhangmingyuan@yuntu-ai.com');
+    assert.strictEqual(events.items[0].matched, true);
+    assert.strictEqual(events.items[0].campaignName, '退信用例');
+
+    // 重复检查不应重复处理（已记录过的 UID 会跳过）
+    const again = await watcher.checkNow({ reason: 'manual' });
+    assert.strictEqual(again.marked, 0);
+
+    // 手动解除后重新回到发送列表
+    watcher.release(contact.id);
+    assert.strictEqual(contact.bounceMarked, false);
+    assert.strictEqual(contact.bounceInfo, null);
+    assert.strictEqual(db4.resolveAudience({ mode: 'all' }).some((c) => c.id === contact.id), true);
+    assert.strictEqual(
+      db4.data.contacts.filter((c) => c.bounceMarked).some((c) => c.id === contact.id),
+      false,
+      '该联系人不应再处于退信标记状态',
+    );
+    fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  await testAsync('未启用 IMAP 的账号会被明确跳过并给出原因', async () => {
+    const d = tmpDir();
+    const db5 = new Database();
+    db5.init(d);
+    const watcher = new BounceWatcher(db5, () => {});
+    for (const a of db5.listAccounts()) a.imap.enabled = false;
+    const summary = await watcher.checkNow({ reason: 'manual' });
+    assert.strictEqual(summary.accounts, 0);
+    assert.ok(summary.message.includes('IMAP'));
+    fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  server.close();
+}
+// ---------------------------------------------------------------------------
+// [13] 浏览器预览模拟层（dev-mock.js）
+// ---------------------------------------------------------------------------
+/**
+ * 浏览器预览（npm run preview）不经过 Electron 主进程，而是由 dev-mock.js 在内存里
+ * 实现同一套 window.api。渲染层新用到的接口一旦在模拟层缺失，预览页就会直接抛错，
+ * 因此这里把 dev-mock 载入 Node，逐项校验界面真正依赖的数据契约。
+ */
+async function runPreviewMockTests() {
+  console.log('\n[13] 浏览器预览模拟层（dev-mock）');
+
+  const sandbox = { console };
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(
+    fs.readFileSync(path.join(__dirname, '../src/renderer/js/dev-mock.js'), 'utf8'),
+    sandbox,
+    { filename: 'dev-mock.js' },
+  );
+  const api = sandbox.api;
+
+  // 接口清单直接从 preload.js 解析，避免两边人工维护导致漂移
+  const preloadSrc = fs.readFileSync(path.join(__dirname, '../src/main/preload.js'), 'utf8');
+  const preloadKeys = Array.from(preloadSrc.matchAll(/^\s{2}([A-Za-z_]\w*):\s*\(.*\)\s*=>\s*invoke\(/gm)).map((m) => m[1]);
+  preloadKeys.push('onEvent'); // 事件订阅不是 invoke 写法，单独补上
+
+  test(`preload 暴露的 ${preloadKeys.length} 个接口在模拟层中全部存在`, () => {
+    const missing = preloadKeys.filter((k) => typeof api[k] !== 'function');
+    assert.deepStrictEqual(missing, [], `模拟层缺少：${missing.join(', ')}`);
+  });
+
+  // ---------------- 发送节奏 ----------------
+  const meta = (await api.pacingMeta()).data;
+  test('pacingMeta 返回节奏预设与账号池策略', () => {
+    assert.strictEqual(meta.presets.length, 4);
+    assert.strictEqual(meta.strategies.length, 2);
+    meta.presets.forEach((p) => assert.ok(p.key && p.label && p.config, `预设字段不完整：${p.key}`));
+  });
+
+  await testAsync('paceEstimate 的说明文案与实际执行模块保持一致', async () => {
+    const est = (await api.paceEstimate({ throttle: { mode: 'random', delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 10, hourlyLimit: 60 }, total: 120 })).data;
+    assert.ok(est.ms > 0);
+    // 同样的配置在主进程模块里应产生同样的描述
+    assert.strictEqual(est.describe, pacing.describe({ mode: 'random', delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 10, hourlyLimit: 60 }));
+    assert.strictEqual(est.text, pacing.humanizeMs(pacing.estimateMs({ mode: 'random', delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 10, hourlyLimit: 60 }, 120)));
+    const old = (await api.paceEstimate({ throttle: { intervalSeconds: 6 }, total: 10 })).data;
+    assert.ok(old.describe.includes('固定间隔 6 秒/封'), old.describe);
+  });
+
+  // ---------------- Spintax ----------------
+  const templates = (await api.listTemplates()).data;
+  const tplSeed = templates[0];
+  const spinInfo = (await api.spintaxInfo({ subject: tplSeed.subject, body: tplSeed.body })).data;
+  test('种子模板的 Spintax 变体数与主进程算法一致', () => {
+    assert.strictEqual(spinInfo.totalVariants, spintax.countVariants(tplSeed.subject) * spintax.countVariants(tplSeed.body));
+    assert.strictEqual(spinInfo.subjectVariants, spintax.countVariants(tplSeed.subject));
+    assert.strictEqual(spinInfo.bodyVariants, spintax.countVariants(tplSeed.body));
+    assert.strictEqual(spinInfo.samples.length, 5);
+  });
+
+  await testAsync('previewTemplate 按组合序号取到不同措辞，且变量全部替换', async () => {
+    const total = spinInfo.totalVariants;
+    const probe = Math.min(total, 40);
+    const seen = new Set();
+    const subjects = new Set();
+    for (let i = 0; i < probe; i += 1) {
+      const idx = Math.floor((i * total) / probe); // 均匀铺开，避免落在同一个主题变体上
+      const r = (await api.previewTemplate({ subject: tplSeed.subject, body: tplSeed.body, spinIndex: idx })).data;
+      assert.strictEqual(r.rendered.spintax.totalVariants, total);
+      assert.ok(!/\{\{/.test(r.rendered.subject), `主题残留变量：${r.rendered.subject}`);
+      assert.ok(!/\{\{/.test(r.rendered.body), '正文残留变量');
+      seen.add(`${r.rendered.subject}\u0000${r.rendered.body}`);
+      subjects.add(r.rendered.subject);
+    }
+    assert.strictEqual(seen.size, probe, `${probe} 个组合序号应产生 ${probe} 种内容，实际 ${seen.size}`);
+    assert.ok(subjects.size > 1, '主题也应随组合轮换');
+  });
+
+  await testAsync('纯变量模板不会被 Spintax 解析器破坏', async () => {
+    const r = (await api.previewTemplate({ subject: '{{公司名}} 测试', body: '{{联系人}} 你好', spinIndex: 0 })).data;
+    assert.ok(!/\{\{/.test(r.rendered.subject));
+    assert.ok(r.rendered.subject.includes('测试'));
+    const info = (await api.spintaxInfo({ subject: '{{公司名}} 测试', body: '{{联系人}} 你好' })).data;
+    assert.strictEqual(info.hasSpintax, false);
+    assert.strictEqual(info.totalVariants, 1);
+  });
+
+  // ---------------- 多账号轮询 ----------------
+  const accIds = (await api.listAccounts()).data.map((a) => a.id);
+  await testAsync('任务可保存账号池配置并回传 poolEmails / paceText', async () => {
+    const before = (await api.listCampaigns()).data;
+    assert.ok(before.every((c) => typeof c.paceText === 'string' && Array.isArray(c.poolEmails)));
+    const saved = (await api.saveCampaign({
+      name: '池模式自测',
+      templateId: tplSeed.id,
+      kind: 'manual',
+      schedule: { type: 'manual' },
+      audience: { mode: 'all' },
+      throttle: { mode: 'random', delayMinSeconds: 30, delayMaxSeconds: 60 },
+      accountMode: 'pool',
+      accountIds: accIds,
+      accountStrategy: 'roundRobin',
+      dryRun: true,
+    })).data;
+    assert.strictEqual(saved.accountMode, 'pool');
+    assert.strictEqual(saved.accountIds.length, accIds.length);
+    const reloaded = (await api.listCampaigns()).data.find((c) => c.id === saved.id);
+    assert.strictEqual(reloaded.poolEmails.length, accIds.length);
+    assert.ok(reloaded.paceText.includes('随机延迟 30–60 秒/封'), reloaded.paceText);
+    await api.removeCampaign(saved.id);
+  });
+
+  // ---------------- 退信标记与发送列表剔除 ----------------
+  const marked = (await api.listContacts({ status: 'bounceMarked' })).data.items;
+  test('种子数据里存在被标记退信的地址（用于演示剔除效果）', () => {
+    assert.ok(marked.length >= 1);
+    assert.ok(marked[0].bounceInfo && marked[0].bounceInfo.source);
+  });
+
+  await testAsync('被标记退信的地址会同时从「仅可发送」列表与受众中剔除', async () => {
+    const activeBefore = (await api.listContacts({ status: 'active' })).data.items;
+    assert.ok(!activeBefore.some((c) => c.bounceMarked));
+    const audience = (await api.previewCampaignAudience({ mode: 'all' })).data.total;
+    assert.strictEqual(audience, activeBefore.length);
+
+    const target = marked[0];
+    const released = (await api.releaseContactBounce({ id: target.id })).data;
+    assert.strictEqual(released.bounceMarked, false);
+    assert.strictEqual(released.bounceInfo, null);
+    assert.strictEqual(released.subscribed, true);
+    const activeAfter = (await api.listContacts({ status: 'active' })).data.items;
+    assert.strictEqual(activeAfter.length, activeBefore.length + 1, '解除标记后应重新进入发送列表');
+
+    // 复原，避免污染后续用例
+    await api.markContactBounced({ id: target.id, note: '手动标记' });
+    const reMarked = (await api.listContacts({ status: 'bounceMarked' })).data.items.find((c) => c.id === target.id);
+    assert.ok(reMarked, '应能再次打上退信标记');
+    assert.strictEqual(reMarked.bounceInfo.source, 'manual');
+  });
+
+  // ---------------- IMAP 退信监听 ----------------
+  const bs = (await api.bounceState()).data;
+  test('bounceState 结构完整（账号状态 + 三个计数）', () => {
+    assert.ok(Array.isArray(bs.accounts) && bs.accounts.length > 0);
+    assert.strictEqual(typeof bs.enabledAccountCount, 'number');
+    assert.strictEqual(typeof bs.markedCount, 'number');
+    assert.strictEqual(typeof bs.eventCount, 'number');
+    assert.strictEqual(typeof bs.autoCheck, 'boolean');
+    assert.strictEqual(typeof bs.pollMinutes, 'number');
+    bs.accounts.forEach((a) => {
+      ['host', 'mailbox', 'readiness', 'lastCheckAt', 'lastFound'].forEach((k) => assert.ok(k in a, `账号状态缺少字段 ${k}`));
+    });
+  });
+
+  await testAsync('listBounces 支持类型 / 匹配情况 / 关键字筛选', async () => {
+    const all = (await api.listBounces({})).data;
+    assert.ok(all.total >= 1);
+    assert.ok(all.items[0].email && all.items[0].type && 'matched' in all.items[0]);
+    assert.strictEqual((await api.listBounces({ matched: 'matched' })).data.total, all.total);
+    assert.strictEqual((await api.listBounces({ type: 'soft' })).data.total, 0);
+    assert.strictEqual((await api.listBounces({ keyword: '绝不存在的关键字zzz' })).data.total, 0);
+  });
+
+  await testAsync('checkBounces / testImap 在预览模式下给出明确的模拟结果', async () => {
+    const summary = (await api.checkBounces({ manual: true })).data;
+    assert.ok(typeof summary.checkedAt === 'string');
+    assert.strictEqual(typeof summary.scanned, 'number');
+    assert.ok(Array.isArray(summary.errors));
+
+    const ready = bs.accounts.find((a) => a.enabled && !a.readiness);
+    assert.ok(ready, `应有一个配置完整的 IMAP 账号，实际：${bs.accounts.map((a) => a.readiness).join(' | ')}`);
+    const okRes = (await api.testImap({ id: ready.id })).data;
+    assert.strictEqual(okRes.ok, true);
+    assert.ok(okRes.message.includes('IMAP'));
+    assert.strictEqual(typeof okRes.durationMs, 'number');
+
+    // 未保存的新账号（draft）也要能测试：密码留空时沿用发信密码
+    const draft = (await api.testImap({ draft: { email: 'new@example.com', pass: 'code', user: '', imap: { enabled: true, host: 'imap.example.com', port: 993, mailbox: 'INBOX' } } })).data;
+    assert.strictEqual(draft.ok, true, JSON.stringify(draft));
+    const noPass = (await api.testImap({ draft: { email: 'new@example.com', pass: '', user: '', imap: { enabled: true, host: 'imap.example.com', port: 993 } } })).data;
+    assert.strictEqual(noPass.ok, false);
+    assert.ok(noPass.message.includes('密码'), noPass.message);
+    const noHost = (await api.testImap({ draft: { imap: { enabled: true, host: '' } } })).data;
+    assert.strictEqual(noHost.ok, false);
+    assert.ok(noHost.message.includes('服务器'), noHost.message);
+  });
+
+  // ---------------- 总览 / 设置 / 账号 ----------------
+  const ov = (await api.overview()).data;
+  test('overview 提供退信相关指标（看板依赖）', () => {
+    assert.ok(ov.bounceMarkedCount >= 1);
+    assert.ok(ov.bounceEventCount >= 1);
+    assert.strictEqual(typeof ov.lastImapCheckAt, 'string');
+  });
+
+  await testAsync('overview 的可发送人数与「仅可发送」列表一致（已排除退信地址）', async () => {
+    const active = (await api.listContacts({ status: 'active' })).data.items.length;
+    assert.strictEqual(ov.activeContactCount, active);
+  });
+
+  const settings = (await api.getSettings()).data;
+  test('settings 含完整默认节奏与 IMAP 全局开关', () => {
+    ['mode', 'intervalSeconds', 'delayMinSeconds', 'delayMaxSeconds', 'burstEvery', 'hourlyLimit', 'dailyLimit', 'maxRetries'].forEach((k) =>
+      assert.ok(k in settings.defaultThrottle, `默认节奏缺少字段 ${k}`),
+    );
+    ['imapAutoCheck', 'imapPollMinutes', 'imapAutoMarkBounce', 'imapBounceType'].forEach((k) =>
+      assert.ok(k in settings, `设置缺少字段 ${k}`),
+    );
+  });
+
+  await testAsync('账号可保存 IMAP 配置（账号页表单依赖）', async () => {
+    const accounts = (await api.listAccounts()).data;
+    assert.ok(accounts.some((a) => a.imap && typeof a.imap === 'object'));
+    const imap = { enabled: true, host: 'imap.exmail.qq.com', port: 993, secure: true, user: '', pass: '', mailbox: 'INBOX', searchDays: 30, markSeen: true, allowInsecure: false };
+    const saved = (await api.saveAccount(Object.assign({}, accounts[0], { imap }))).data;
+    assert.strictEqual(saved.imap.host, 'imap.exmail.qq.com');
+    assert.strictEqual(saved.imap.enabled, true);
+    assert.strictEqual(saved.imap.markSeen, true);
+  });
+}

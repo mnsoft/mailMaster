@@ -31,6 +31,36 @@
     return s;
   }
 
+  const BOUNCE_TYPE_TEXT = { hard: '硬退信', soft: '临时退信', blocked: '被拒收' };
+
+  /** 询问退信原因（Electron 不支持 window.prompt，统一用模态框代替） */
+  function askNote() {
+    return new Promise((resolve) => {
+      const ctx = MM.modal({
+        title: '标记为退信',
+        size: 'narrow',
+        body: `
+          <div class="field">
+            <label class="field-label">退信原因（可留空）</label>
+            <input class="input" data-role="note" placeholder="例：客户反馈邮箱已停用 / 服务器退信" />
+            <div class="field-hint">该地址会被打上退信标记，并从后续所有推广的发送列表中剔除，直到你手动解除标记。</div>
+          </div>`,
+        footer: `<button class="btn" data-cancel>取消</button><button class="btn btn-danger" data-ok>标记为退信</button>`,
+      });
+      const input = ctx.$('[data-role="note"]');
+      input.focus();
+      const done = (value) => {
+        ctx.close();
+        resolve(value);
+      };
+      ctx.$('[data-cancel]').onclick = () => done(null);
+      ctx.$('[data-ok]').onclick = () => done(input.value);
+      input.onkeydown = (e) => {
+        if (e.key === 'Enter') done(input.value);
+      };
+    });
+  }
+
   function tableHtml(rows) {
     if (!rows.length) {
       return `<div class="empty"><strong>没有符合条件的联系人</strong>点击右上角「新增联系人」或「导入 CSV」批量添加推广名单。</div>`;
@@ -48,8 +78,9 @@
           <th class="num">成功</th>
           <th class="num">失败</th>
           <th class="num">退信</th>
+          <th>退信标记</th>
           <th>最近投递</th>
-          <th style="width:170px"></th>
+          <th style="width:190px"></th>
         </tr>
       </thead>
       <tbody>
@@ -61,7 +92,9 @@
                 <span class="cell-strong">${MM.esc(c.company || '—')}</span>
                 <span class="cell-sub">${MM.esc([c.position, c.city].filter(Boolean).join(' · ') || '—')}</span>
               </td>
-              <td>${MM.esc(c.contact || '—')}${c.subscribed === false ? ' <span class="badge badge-bounced">已停用</span>' : ''}</td>
+              <td>${MM.esc(c.contact || '—')}${
+                c.bounceMarked ? ' <span class="badge badge-bounced" title="已标记退信，不会出现在任何推广的发送列表中">退信</span>' : ''
+              }${c.subscribed === false ? ' <span class="badge badge-paused" title="已停用，不会收到推广邮件">已停用</span>' : ''}</td>
               <td>${MM.esc(c.salutation || '—')}</td>
               <td class="mono" style="font-size:11.5px">${MM.esc(c.email)}</td>
               <td class="mono" style="font-size:11.5px">${MM.esc(c.phone || '—')}</td>
@@ -69,13 +102,29 @@
               <td class="num" style="color:var(--success)">${c.stats?.success || 0}</td>
               <td class="num" style="color:${c.stats?.failed ? 'var(--danger)' : 'var(--text-faint)'}">${c.stats?.failed || 0}</td>
               <td class="num" style="color:${c.stats?.bounced ? 'var(--warn)' : 'var(--text-faint)'}">${c.stats?.bounced || 0}</td>
+              <td>
+                ${
+                  c.bounceMarked
+                    ? `<span class="badge badge-bounced">${MM.esc(BOUNCE_TYPE_TEXT[(c.bounceInfo || {}).type] || '已标记')}</span>
+                       <span class="cell-sub" title="${MM.attr((c.bounceInfo || {}).reason || (c.bounceInfo || {}).diagnostic || '')}">
+                         ${MM.esc((c.bounceInfo || {}).source === 'manual' ? '人工标记' : 'IMAP 自动监听')}${
+                           (c.bounceInfo || {}).at ? ` · ${MM.esc(MM.fmtDate(c.bounceInfo.at, true).slice(5, 16))}` : ''
+                         }
+                       </span>`
+                    : '<span style="color:var(--text-faint)">—</span>'
+                }
+              </td>
               <td style="font-size:11.5px;color:var(--text-faint)">
                 ${c.lastSentAt ? `${MM.esc(MM.fmtTimeShort(c.lastSentAt))} ${MM.statusBadge(c.lastStatus)}` : '—'}
               </td>
               <td>
                 <div class="row-actions">
                   <button class="btn btn-sm btn-ghost" data-action="edit">编辑</button>
-                  <button class="btn btn-sm btn-ghost" data-action="bounce" title="手动标记为退信">退信</button>
+                  ${
+                    c.bounceMarked
+                      ? '<button class="btn btn-sm btn-primary" data-action="release" title="解除退信标记，该地址会重新进入推广发送列表">解除退信</button>'
+                      : '<button class="btn btn-sm btn-ghost" data-action="bounce" title="手动标记为退信，将从推广发送列表中剔除">标记退信</button>'
+                  }
                   <button class="btn btn-sm btn-danger" data-action="remove">删除</button>
                 </div>
               </td>
@@ -157,7 +206,7 @@
           ${MM.statCard({ label: '名单总数', value: state.rows.length, sub: `筛选结果 / 全库 ${MM.state.overview ? MM.state.overview.userCount : '—'}` })}
           ${MM.statCard({ label: '当前筛选成功数', value: s.success, sub: '统计累计成功投递', tone: 's-success' })}
           ${MM.statCard({ label: '当前筛选失败数', value: s.failed, sub: '含临时性失败', tone: 's-danger' })}
-          ${MM.statCard({ label: '当前筛选退信数', value: s.bounced, sub: '退信地址已自动停用', tone: 's-warn' })}
+          ${MM.statCard({ label: '当前筛选退信数', value: s.bounced, sub: '退信地址会被自动标记并剔除', tone: 's-warn' })}
         </div>
 
         <div class="toolbar">
@@ -170,10 +219,12 @@
             <option value="active" ${state.status === 'active' ? 'selected' : ''}>仅可发送</option>
             <option value="all" ${state.status === 'all' ? 'selected' : ''}>全部</option>
             <option value="hasBounce" ${state.status === 'hasBounce' ? 'selected' : ''}>有退信记录</option>
+            <option value="bounceMarked" ${state.status === 'bounceMarked' ? 'selected' : ''}>已标记退信（被剔除）</option>
             <option value="unsubscribed" ${state.status === 'unsubscribed' ? 'selected' : ''}>已停用</option>
           </select>
           <div class="spacer"></div>
           <span class="pill">已选 <b data-role="sel-count">${state.selected.size}</b> 项</span>
+          <button class="btn btn-sm" data-act="bulk-release" ${state.selected.size ? '' : 'disabled'}>批量解除退信标记</button>
           <button class="btn btn-sm btn-danger" data-act="bulk-remove" ${state.selected.size ? '' : 'disabled'}>批量删除</button>
         </div>
 
@@ -196,6 +247,15 @@
         view.querySelectorAll('.stat-value')[3].textContent = MM.fmtNumber(s2.bounced);
       };
 
+      /** 同步「已选 N 项」与批量操作按钮的可用状态 */
+      const syncBulk = () => {
+        const n = state.selected.size;
+        view.querySelector('[data-role="sel-count"]').textContent = n;
+        view.querySelector('[data-act="bulk-remove"]').disabled = !n;
+        const release = view.querySelector('[data-act="bulk-release"]');
+        if (release) release.disabled = !n;
+      };
+
       const bindTable = () => {
         const table = view.querySelector('[data-role="table"]');
         const checkAll = table.querySelector('[data-check-all]');
@@ -205,9 +265,7 @@
             state.selected.clear();
             if (checkAll.checked) state.rows.forEach((c) => state.selected.add(c.id));
             rerenderTable();
-            view.querySelector('[data-role="sel-count"]').textContent = state.selected.size;
-            const bulk = view.querySelector('[data-act="bulk-remove"]');
-            bulk.disabled = !state.selected.size;
+            syncBulk();
           };
         }
         table.querySelectorAll('tr[data-id]').forEach((tr) => {
@@ -216,8 +274,7 @@
           checkbox.onchange = () => {
             if (checkbox.checked) state.selected.add(id);
             else state.selected.delete(id);
-            view.querySelector('[data-role="sel-count"]').textContent = state.selected.size;
-            view.querySelector('[data-act="bulk-remove"]').disabled = !state.selected.size;
+            syncBulk();
           };
           tr.querySelectorAll('[data-action]').forEach((btn) => {
             btn.onclick = async () => {
@@ -238,11 +295,24 @@
                 }
               }
               if (btn.dataset.action === 'bounce') {
-                const note = window.prompt('标记为退信的原因（可留空）：', '手动标记');
+                const note = await askNote();
                 if (note === null) return;
                 const res = await MM.api.markContactBounced({ id, note });
                 if (res.ok) {
-                  MM.toast('已标记为退信并停用该地址', 'warn');
+                  MM.toast('已标记为退信，该地址会从后续推广的发送列表中剔除', 'warn', 6500);
+                  await reload();
+                } else MM.toast(res.error, 'error');
+              }
+              if (btn.dataset.action === 'release') {
+                const yes = await MM.confirm({
+                  title: '解除退信标记',
+                  message: `将解除 <b>${MM.esc(contact.email)}</b> 的退信标记，该地址会<b>重新进入下一轮推广的发送列表</b>。<br/>若地址确实无效，重新发送后会再次产生退信并被自动标记。`,
+                  confirmText: '解除标记',
+                });
+                if (!yes) return;
+                const res = await MM.api.releaseContactBounce({ id });
+                if (res.ok) {
+                  MM.toast('已解除退信标记，该地址重新进入发送列表', 'success');
                   await reload();
                 } else MM.toast(res.error, 'error');
               }
@@ -284,6 +354,31 @@
         state.selected.clear();
         MM.toast(`已删除 ${ids.length} 个联系人`, 'success');
         await reload();
+      };
+
+      /** 批量解除退信标记：让被剔除的地址重新进入发送列表 */
+      view.querySelector('[data-act="bulk-release"]').onclick = async () => {
+        const ids = new Set(state.selected);
+        const targets = state.rows.filter((c) => ids.has(c.id) && c.bounceMarked);
+        if (!targets.length) {
+          MM.toast('所选联系人中没有带退信标记的地址', 'warn', 6000);
+          return;
+        }
+        const yes = await MM.confirm({
+          title: '批量解除退信标记',
+          message: `将为选中的 <b>${targets.length}</b> 个地址解除退信标记，它们会重新进入推广发送列表。<br/>若地址确实无效，重新发送后会再次产生退信并被自动标记。`,
+          confirmText: '全部解除',
+        });
+        if (!yes) return;
+        let done = 0;
+        for (const c of targets) {
+          const res = await MM.api.releaseContactBounce({ id: c.id });
+          if (res.ok) done += 1;
+        }
+        MM.toast(`已解除 ${done} 个地址的退信标记`, done ? 'success' : 'error');
+        state.selected.clear();
+        await reload();
+        syncBulk();
       };
 
       view.querySelector('[data-act="export"]').onclick = async (e) => {

@@ -69,9 +69,139 @@
     };
   }
 
-  function render(text, contact, g) {
+  /* ---------------- Spintax（与主进程 src/main/spintax.js 行为一致的轻量实现） ---------------- */
+  const MAX_SPIN_DEPTH = 12;
+  const GUARD_OPEN = '\u0001';
+  const GUARD_CLOSE = '\u0002';
+  const GUARD_RE = new RegExp(`${GUARD_OPEN}(\\d+)${GUARD_CLOSE}`, 'g');
+
+  function splitSpinOptions(nodes) {
+    const options = [[]];
+    nodes.forEach((node) => {
+      if (node.type === 'text' && node.value.includes('|')) {
+        node.value.split('|').forEach((part, i) => {
+          if (i > 0) options.push([]);
+          if (part) options[options.length - 1].push({ type: 'text', value: part });
+        });
+        return;
+      }
+      options[options.length - 1].push(node);
+    });
+    return options;
+  }
+
+  function parseSpinNodes(src, start, depth) {
+    const nodes = [];
+    let buf = '';
+    let pos = start;
+    const flush = () => {
+      if (buf) {
+        nodes.push({ type: 'text', value: buf });
+        buf = '';
+      }
+    };
+    while (pos < src.length) {
+      const ch = src[pos];
+      if (ch === '\\' && (src[pos + 1] === '{' || src[pos + 1] === '}')) {
+        buf += src[pos + 1];
+        pos += 2;
+        continue;
+      }
+      if (ch === '}') {
+        flush();
+        return { nodes, pos, closed: true };
+      }
+      if (ch === '{') {
+        if (depth >= MAX_SPIN_DEPTH) {
+          buf += ch;
+          pos += 1;
+          continue;
+        }
+        const inner = parseSpinNodes(src, pos + 1, depth + 1);
+        if (!inner.closed) {
+          buf += ch;
+          pos += 1;
+          continue;
+        }
+        flush();
+        nodes.push({ type: 'group', options: splitSpinOptions(inner.nodes) });
+        pos = inner.pos + 1;
+        continue;
+      }
+      buf += ch;
+      pos += 1;
+    }
+    flush();
+    return { nodes, pos, closed: false };
+  }
+
+  const isSpin = (node) => node.type === 'group' && node.options.length > 1;
+  const parseSpin = (src) => parseSpinNodes(String(src == null ? '' : src), 0, 0).nodes;
+
+  function countSpinNodes(nodes) {
+    let total = 1;
+    nodes.forEach((node) => {
+      if (node.type === 'text') return;
+      total *= isSpin(node) ? node.options.reduce((sum, option) => sum + countSpinNodes(option), 0) : countSpinNodes(node.options[0] || []);
+    });
+    return total;
+  }
+
+  /** 模板可产生的不同内容组合数（无 Spintax 时为 1） */
+  const spinVariants = (src) => Math.max(1, countSpinNodes(parseSpin(src)));
+
+  function renderSpinByIndex(nodes, index) {
+    let rest = index;
+    let out = '';
+    nodes.forEach((node) => {
+      if (node.type === 'text') {
+        out += node.value;
+        return;
+      }
+      if (!isSpin(node)) {
+        out += `{${renderSpinByIndex(node.options[0] || [], rest)}}`;
+        return;
+      }
+      const sizes = node.options.map((option) => countSpinNodes(option));
+      const total = sizes.reduce((a, b) => a + b, 0) || 1;
+      let local = ((rest % total) + total) % total;
+      let picked = 0;
+      for (let i = 0; i < sizes.length; i += 1) {
+        if (local < sizes[i]) {
+          picked = i;
+          break;
+        }
+        local -= sizes[i];
+      }
+      rest = Math.floor(rest / total);
+      out += renderSpinByIndex(node.options[picked], local);
+    });
+    return out;
+  }
+
+  /** 展开 Spintax；index 为 null 时随机取一组 */
+  function expandSpin(src, index) {
+    const nodes = parseSpin(src);
+    const variants = Math.max(1, countSpinNodes(nodes));
+    const idx = index == null ? Math.floor(Math.random() * variants) % variants : Number(index);
+    return { text: renderSpinByIndex(nodes, idx), variants, index: idx };
+  }
+
+  /**
+   * 渲染模板：先保护 {{变量}}，再按序号展开 Spintax，最后替换变量
+   * （顺序必须与主进程 template.js 一致，否则 {{公司名}} 会被误判成 Spintax 组）
+   */
+  function render(text, contact, g, spinIndex) {
     const missing = [];
-    const out = String(text || '').replace(/\{\{\s*([^{}\n]{1,40}?)\s*\}\}/g, (_m, raw) => {
+    const source = String(text == null ? '' : text);
+    const store = [];
+    const guarded = source.replace(/\{\{\s*([^{}\n]{1,40}?)\s*\}\}/g, (full) => {
+      store.push(full);
+      return `${GUARD_OPEN}${store.length - 1}${GUARD_CLOSE}`;
+    });
+    const spun = expandSpin(guarded, spinIndex);
+    const restored = spun.text.replace(GUARD_RE, (matched, i) => (store[Number(i)] == null ? matched : store[Number(i)]));
+    const out = restored.replace(/\{\{\s*([^{}\n]{1,40}?)\s*\}\}/g, (_m, raw) => {
       const key = resolveVar(raw);
       if (!key) {
         missing.push(String(raw).trim());
@@ -84,7 +214,7 @@
       }
       return String(Array.isArray(value) ? value.join('、') : value);
     });
-    return { text: out, missing };
+    return { text: out, missing, variants: spun.variants, index: spun.index };
   }
 
   function scan(text) {
@@ -96,6 +226,94 @@
       set.set(raw, { raw, varName: key || raw, known: Boolean(key), label: key || raw });
     }
     return Array.from(set.values());
+  }
+
+  /* ---------------- 发送节奏（与主进程 src/main/pacing.js 一致的轻量实现） ---------------- */
+  const PACING_DEFAULTS = {
+    mode: 'fixed',
+    intervalSeconds: 10,
+    delayMinSeconds: 20,
+    delayMaxSeconds: 90,
+    burstEvery: 0,
+    burstMinSeconds: 180,
+    burstMaxSeconds: 420,
+    hourlyLimit: 0,
+    dailyLimit: 200,
+    maxRetries: 1,
+  };
+  const PACING_PRESETS = [
+    { key: 'steady', label: '稳健匀速', hint: '固定 10 秒/封，适合自建 SMTP 通道', config: { mode: 'fixed', intervalSeconds: 10, burstEvery: 0, hourlyLimit: 0, dailyLimit: 200, maxRetries: 1 } },
+    {
+      key: 'human',
+      label: '拟人节奏（推荐）',
+      hint: '20–90 秒随机 + 每 10 封长休息，最接近人工发送',
+      config: { mode: 'random', delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 10, burstMinSeconds: 180, burstMaxSeconds: 420, hourlyLimit: 60, dailyLimit: 200, maxRetries: 1 },
+    },
+    {
+      key: 'conservative',
+      label: '保守低频',
+      hint: '1–3 分钟随机 + 每小时 20 封上限，适合普通邮箱 SMTP',
+      config: { mode: 'random', delayMinSeconds: 60, delayMaxSeconds: 180, burstEvery: 8, burstMinSeconds: 600, burstMaxSeconds: 1200, hourlyLimit: 20, dailyLimit: 80, maxRetries: 1 },
+    },
+    { key: 'fast', label: '快速通道', hint: '5 秒/封，配合腾讯云邮件推送等专业通道使用', config: { mode: 'fixed', intervalSeconds: 5, burstEvery: 0, hourlyLimit: 0, dailyLimit: 1000, maxRetries: 2 } },
+  ];
+  const ACCOUNT_STRATEGIES = [
+    { key: 'roundRobin', label: '轮询（推荐）', hint: '按顺序依次使用每个账号，用量最均衡' },
+    { key: 'random', label: '随机', hint: '每封在可用账号中随机挑选，分布更不规律' },
+  ];
+
+  function normPace(input) {
+    const raw = Object.assign({}, PACING_DEFAULTS, input || {});
+    const num = (v, d) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : d);
+    const clampMin = (v, d) => Math.max(0, num(v, d));
+    const delayMin = clampMin(raw.delayMinSeconds, PACING_DEFAULTS.delayMinSeconds);
+    const burstMin = clampMin(raw.burstMinSeconds, PACING_DEFAULTS.burstMinSeconds);
+    return {
+      mode: raw.mode === 'random' ? 'random' : 'fixed',
+      intervalSeconds: clampMin(raw.intervalSeconds, PACING_DEFAULTS.intervalSeconds),
+      delayMinSeconds: delayMin,
+      delayMaxSeconds: Math.max(delayMin, clampMin(raw.delayMaxSeconds, PACING_DEFAULTS.delayMaxSeconds)),
+      burstEvery: clampMin(raw.burstEvery, 0),
+      burstMinSeconds: burstMin,
+      burstMaxSeconds: Math.max(burstMin, clampMin(raw.burstMaxSeconds, PACING_DEFAULTS.burstMaxSeconds)),
+      hourlyLimit: clampMin(raw.hourlyLimit, 0),
+      dailyLimit: clampMin(raw.dailyLimit, PACING_DEFAULTS.dailyLimit),
+      maxRetries: clampMin(raw.maxRetries, PACING_DEFAULTS.maxRetries),
+    };
+  }
+
+  function describePace(input) {
+    const cfg = normPace(input);
+    const parts = [cfg.mode === 'random' ? `随机延迟 ${cfg.delayMinSeconds}–${cfg.delayMaxSeconds} 秒/封` : `固定间隔 ${cfg.intervalSeconds} 秒/封`];
+    if (cfg.burstEvery > 0) parts.push(`每 ${cfg.burstEvery} 封后休息 ${cfg.burstMinSeconds}–${cfg.burstMaxSeconds} 秒`);
+    if (cfg.hourlyLimit > 0) parts.push(`每小时最多 ${cfg.hourlyLimit} 封`);
+    if (cfg.dailyLimit > 0) parts.push(`每日最多 ${cfg.dailyLimit} 封`);
+    return parts.join(' · ');
+  }
+
+  function humanizeMs(ms) {
+    if (!ms || ms < 1000) return '几乎瞬时';
+    const total = Math.round(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `约 ${h} 小时 ${m} 分`;
+    if (m > 0) return `约 ${m} 分 ${s} 秒`;
+    return `约 ${s} 秒`;
+  }
+
+  function estimatePaceMs(input, total) {
+    const cfg = normPace(input);
+    const count = Math.max(0, Math.round(Number(total) || 0));
+    if (count <= 0) return 0;
+    const average = cfg.mode === 'random' ? (cfg.delayMinSeconds + cfg.delayMaxSeconds) / 2 : cfg.intervalSeconds;
+    let ms = average * 1000 * Math.max(0, count - 1);
+    if (cfg.burstEvery > 0) {
+      const bursts = Math.floor(Math.max(0, count - 1) / cfg.burstEvery);
+      ms += bursts * ((cfg.burstMinSeconds + cfg.burstMaxSeconds) / 2 - average) * 1000;
+    }
+    if (cfg.hourlyLimit > 0 && count > cfg.hourlyLimit) ms += (Math.ceil(count / cfg.hourlyLimit) - 1) * 3600 * 1000;
+    return Math.max(0, Math.round(ms));
   }
 
   // ---------------- 种子数据 ----------------
@@ -125,6 +343,9 @@
     subscribedAt: iso(),
     createdAt: iso(),
     updatedAt: iso(),
+    // 退信标记：被标记的地址会从所有推广的发送列表中剔除，直到手动解除
+    bounceMarked: false,
+    bounceInfo: null,
     stats: { attempts: 0, success: 0, failed: 0, bounced: 0 },
     lastStatus: null,
     lastSentAt: null,
@@ -134,16 +355,28 @@
     {
       id: uid('tpl'),
       name: '标准产品推广（中文）',
-      subject: '{{公司名}} · 关于智能采集方案的沟通（{{联系人}}）',
-      body: '尊敬的{{称呼}}{{联系人}}：\n\n您好！我是{{发件方公司}}的{{发件人}}。\n\n了解到{{公司名}}在{{城市}}的业务发展，我们近期为同行业客户落地的「智能数据采集与自动化处理方案」或许对您有帮助：\n\n· 采集效率提升 3 倍以上，人工成本下降约 40%\n· 支持与现有系统无缝对接，7 天即可完成部署\n· 提供 30 天免费试用与专属技术支持\n\n如果方便，我可以在本周内为您安排一次 20 分钟的线上演示。\n\n期待与{{公司名}}的合作。\n\n{{发件人}}\n{{发件方公司}}\n{{日期}}',
+      subject: '{{公司名}} · {关于|聊聊}{智能采集|数据采集}方案的{沟通|交流}（{{联系人}}）',
+      body:
+        '{尊敬的|您好，}{{称呼}}{{联系人}}：\n\n' +
+        '{我是|我们是}{{发件方公司}}的{{发件人}}。\n\n' +
+        '了解到{{公司名}}在{{城市}}的业务发展，我们近期为同行业客户落地的「{智能数据采集|自动化数据采集}与自动化处理方案」{或许|可能}对您有帮助：\n\n' +
+        '· 采集效率提升 3 倍以上，人工成本下降约 40%\n' +
+        '· 支持与现有系统无缝对接，7 天即可完成部署\n' +
+        '· 提供 30 天免费试用与专属技术支持\n\n' +
+        '{如果方便|方便的话}，我可以在本周内为您安排一次 20 分钟的线上演示。\n\n' +
+        '期待与{{公司名}}的{合作|进一步交流}。\n\n{{发件人}}\n{{发件方公司}}\n{{日期}}',
       createdAt: iso(),
       updatedAt: iso(),
     },
     {
       id: uid('tpl'),
       name: '简短跟进（老客户）',
-      subject: '{{联系人}}您好，{{公司名}}的方案跟进',
-      body: '{{称呼}}{{联系人}}，您好：\n\n上次与您沟通的方案已更新到最新版本，其中针对{{公司名}}关注的成本问题做了优化。\n方便的话我给您发一份最新资料，您电话{{电话}}是否仍可联系？\n\n顺祝商祺！\n{{发件人}} · {{发件方公司}}\n{{日期时间}}',
+      subject: '{{联系人}}您好，{{公司名}}的{方案|项目}跟进',
+      body:
+        '{{称呼}}{{联系人}}，您好：\n\n' +
+        '上次与您{沟通|交流}的方案{已更新|已经更新}到最新版本，其中针对{{公司名}}关注的成本问题做了{优化|调整}。\n' +
+        '{方便的话|如果方便}我给您发一份最新资料，您电话{{电话}}是否仍可联系？\n\n' +
+        '顺祝商祺！\n{{发件人}} · {{发件方公司}}\n{{日期时间}}',
       createdAt: iso(),
       updatedAt: iso(),
     },
@@ -153,9 +386,15 @@
     smtp: { host: 'smtp.example.com', port: 465, secure: true, user: 'marketing@example.com', pass: '', fromName: '市场部 · 王小明', fromEmail: 'marketing@example.com' },
     senderCompany: '示例智能科技有限公司',
     sendMode: 'dryRun',
-    defaultThrottle: { intervalSeconds: 6, dailyLimit: 200, maxRetries: 1 },
+    defaultThrottle: { mode: 'random', intervalSeconds: 10, delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 10, burstMinSeconds: 180, burstMaxSeconds: 420, hourlyLimit: 60, dailyLimit: 200, maxRetries: 1 },
     bounceAutoPause: true,
     bouncePauseThreshold: 5,
+    // IMAP 退信监听（全局）
+    imapAutoCheck: true,
+    imapPollMinutes: 5,
+    imapAutoMarkBounce: true,
+    imapBounceType: 'hard',
+    imapLastCheckAt: null,
     appendFooter: true,
     footerText: '如不希望再收到此类邮件，请回复「退订」，我们将立即为您移除。',
     logRetentionDays: 180,
@@ -177,6 +416,23 @@
       enabled: true,
       isDefault: true,
       dailyLimit: 200,
+      // IMAP 退信监听（浏览器预览里不真正连接，仅用于界面演示）
+      imap: {
+        enabled: true,
+        host: 'imap.example.com',
+        port: 993,
+        secure: true,
+        user: 'marketing@example.com',
+        // 预览演示用的占位授权码：让「退信监听」页展示一个配置完整、状态正常的账号
+        pass: 'demo-imap-auth-code',
+        mailbox: 'INBOX',
+        searchDays: 30,
+        markSeen: true,
+        allowInsecure: false,
+        lastCheckAt: new Date(Date.now() - 26 * 60e3).toISOString(),
+        lastFound: 0,
+        lastError: '',
+      },
       createdAt: iso(),
       updatedAt: iso(),
     },
@@ -278,7 +534,10 @@
         kind: 'manual',
         schedule: { type: 'manual' },
         audience: { mode: 'all', tags: [], ids: [] },
-        throttle: { intervalSeconds: 5, dailyLimit: 200, maxRetries: 1 },
+        throttle: { mode: 'random', delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 10, burstMinSeconds: 180, burstMaxSeconds: 420, hourlyLimit: 60, dailyLimit: 200, maxRetries: 1 },
+        accountMode: 'single',
+        accountIds: [],
+        accountStrategy: 'roundRobin',
         dryRun: true,
         status: 'draft',
         runCount: 0,
@@ -374,6 +633,57 @@
     bounced: logs.filter((l) => l.status === 'bounced').length,
   };
 
+  /* ---------------- 退信事件（IMAP 监听结果） ---------------- */
+  /** 最近一次检查摘要（供「退信监听」页展示） */
+  let lastImapSummary = null;
+
+  // 由历史日志里的退信记录派生，模拟「IMAP 扫描收件箱识别到 DSN 后登记事件」的效果
+  const bounceEvents = logs
+    .filter((l) => l.status === 'bounced')
+    .map((l, i) => ({
+      id: uid('bn'),
+      accountId: l.accountId,
+      accountEmail: l.accountEmail,
+      uid: 101 + i,
+      type: 'hard',
+      status: '5.1.1',
+      diagnostic: '550 5.1.1 收件人地址不存在（用户不存在）',
+      reason: '收件人地址不存在',
+      subject: l.subject,
+      from: 'MAILER-DAEMON@example.com（邮件系统投递失败通知）',
+      date: l.createdAt,
+      originalMessageId: `<demo-${i}@mailmaster.local>`,
+      recipients: [l.email],
+      contactId: l.contactId,
+      email: l.email,
+      company: l.company,
+      contactName: l.contact,
+      campaignId: l.campaignId,
+      campaignName: l.campaignName,
+      logId: l.id,
+      source: 'imap',
+      matched: true,
+      createdAt: l.createdAt,
+    }));
+
+  // 演示：退信事件对应的地址已带上退信标记（与主进程的种子数据行为保持一致）
+  bounceEvents.forEach((e) => {
+    const target = contacts.find((c) => c.id === e.contactId);
+    if (!target || target.bounceMarked) return;
+    target.bounceMarked = true;
+    target.bounceInfo = {
+      at: e.createdAt,
+      type: e.type,
+      status: e.status,
+      reason: e.reason,
+      diagnostic: e.diagnostic,
+      subject: e.subject,
+      accountEmail: e.accountEmail,
+      source: 'imap',
+      eventId: e.id,
+    };
+  });
+
   // ---------------- 调度计算 ----------------
   function nextRun(schedule, from = new Date()) {
     if (!schedule || !schedule.type || schedule.type === 'manual') return null;
@@ -468,7 +778,8 @@
   }
 
   const resolveAudience = (audience = {}) => {
-    const all = contacts.filter((c) => c.subscribed !== false);
+    // 退订与「已标记退信」的地址都不会进入发送列表
+    const all = contacts.filter((c) => c.subscribed !== false && !c.bounceMarked);
     if (audience.mode === 'tags' && audience.tags && audience.tags.length) return all.filter((c) => (c.tags || []).some((t) => audience.tags.includes(t)));
     if (audience.mode === 'ids' && audience.ids && audience.ids.length) {
       const set = new Set(audience.ids);
@@ -502,8 +813,11 @@
     return {
       userCount: contacts.length,
       uniqueEmailCount: emails.size,
-      activeContactCount: contacts.filter((c) => c.subscribed !== false).length,
+      activeContactCount: contacts.filter((c) => c.subscribed !== false && !c.bounceMarked).length,
       bouncedContactCount: contacts.filter((c) => c.stats.bounced > 0).length,
+      bounceMarkedCount: contacts.filter((c) => c.bounceMarked).length,
+      bounceEventCount: bounceEvents.length,
+      lastImapCheckAt: settings.imapLastCheckAt || null,
       totalAttempts: counters.totalAttempts,
       successCount: counters.success,
       failedCount: counters.failed,
@@ -559,8 +873,15 @@
     const control = { cancelled: false, paused: false };
     controls.set(id, control);
     const dry = settings.sendMode !== 'live' || c.dryRun !== false;
-    const account = resolveAccount(c.accountId);
-    const accountLabel = account ? `${account.provider === 'tencent-ses' ? '腾讯云邮件推送 · ' : ''}${account.email}` : '（未配置发信账号）';
+    // 多账号轮询：按顺序把每封邮件分配给不同的发信账号
+    const poolAccounts = (c.accountIds || []).map((id) => accounts.find((x) => x.id === id)).filter((a) => a && a.enabled !== false);
+    const pool = c.accountMode === 'pool' && poolAccounts.length > 1 ? poolAccounts : null;
+    const account = pool ? pool[0] : resolveAccount(c.accountId);
+    const accountLabel = pool
+      ? `账号池 ${pool.length} 个（${pool.map((a) => a.email).join('、')}）`
+      : account
+        ? `${account.provider === 'tencent-ses' ? '腾讯云邮件推送 · ' : ''}${account.email}`
+        : '（未配置发信账号）';
     c.running = true;
     c.lastRunAt = iso();
     c.progress = { total: recipients.length, done: 0, success: 0, failed: 0, bounced: 0, startedAt: iso(), finishedAt: null };
@@ -577,7 +898,8 @@
         if (control.paused) return;
         const ct = recipients[i];
         i += 1;
-        const g = globals(settings, { index: i, total: recipients.length, account });
+        const use = pool ? pool[(i - 1) % pool.length] : account;
+        const g = globals(settings, { index: i, total: recipients.length, account: use });
         const subj = render(tpl.subject, ct, g).text;
         let body = render(tpl.body, ct, g).text;
         if (settings.appendFooter) body += `\n\n————————————\n${settings.footerText}`;
@@ -586,9 +908,9 @@
           id: uid('lg'),
           campaignId: c.id,
           campaignName: c.name,
-          accountId: account ? account.id : null,
-          accountEmail: account ? account.email : '',
-          accountName: account ? account.name : '',
+          accountId: use ? use.id : null,
+          accountEmail: use ? use.email : '',
+          accountName: use ? use.name : '',
           contactId: ct.id,
           company: ct.company,
           contact: ct.contact,
@@ -642,7 +964,7 @@
 
   window.api = {
     // 版本号需与 package.json 的 version 保持一致（浏览器预览模式没有 app.getVersion()）
-    info: () => ok({ name: 'MailMaster', version: '1.0.1', platform: 'browser-preview', electron: '—', dataFile: '（浏览器预览模式：数据保存在内存中，不写入磁盘）', isDev: true }),
+    info: () => ok({ name: 'MailMaster', version: '1.0.2', platform: 'browser-preview', electron: '—', dataFile: '（浏览器预览模式：数据保存在内存中，不写入磁盘）', isDev: true }),
     openDataDir: () => ok(true),
     minimize: () => ok(true),
     toggleMaximize: () => ok(true),
@@ -745,8 +1067,9 @@
       if (kw) list = list.filter((c) => [c.company, c.contact, c.salutation, c.email, c.phone, c.position, c.city, (c.tags || []).join(' ')].join(' ').toLowerCase().includes(kw));
       if (q.tag) list = list.filter((c) => (c.tags || []).includes(q.tag));
       if (q.status === 'hasBounce') list = list.filter((c) => c.stats.bounced > 0);
+      if (q.status === 'bounceMarked') list = list.filter((c) => c.bounceMarked);
       if (q.status === 'unsubscribed') list = list.filter((c) => c.subscribed === false);
-      if (q.status === 'active') list = list.filter((c) => c.subscribed !== false);
+      if (q.status === 'active') list = list.filter((c) => c.subscribed !== false && !c.bounceMarked);
       return ok({ items: list, tags: Array.from(new Set(contacts.flatMap((c) => c.tags || []))), total: contacts.length });
     },
     saveContact: (input) => {
@@ -774,11 +1097,35 @@
     markContactBounced: ({ id, note }) => {
       const c = contacts.find((x) => x.id === id);
       if (!c) return Promise.resolve({ ok: false, error: '联系人不存在' });
-      c.stats.bounced += 1;
-      c.lastStatus = 'bounced';
-      c.subscribed = false;
+      c.bounceMarked = true;
+      c.bounceInfo = {
+        at: iso(),
+        type: 'hard',
+        status: '',
+        reason: note || '人工标记为退信',
+        diagnostic: '',
+        subject: '',
+        accountEmail: '',
+        source: 'manual',
+        eventId: null,
+      };
       c.remark = note ? `${c.remark ? `${c.remark} / ` : ''}手动标记退信：${note}` : c.remark;
-      counters.bounced += 1;
+      c.updatedAt = iso();
+      return ok(c);
+    },
+    /** 解除退信标记：该地址重新进入发送列表 */
+    releaseContactBounce: ({ id }) => {
+      const c = contacts.find((x) => x.id === id);
+      if (!c) return Promise.resolve({ ok: false, error: '联系人不存在' });
+      const previous = c.bounceInfo || {};
+      c.bounceMarked = false;
+      c.bounceInfo = null;
+      c.subscribed = true;
+      if (previous.at) {
+        const stamp = String(previous.at).slice(0, 19).replace('T', ' ');
+        c.remark = `${c.remark ? `${c.remark} / ` : ''}于 ${stamp} 解除退信标记`;
+      }
+      c.updatedAt = iso();
       return ok(c);
     },
     exportContactsCsv: () => ok({ canceled: false, filePath: '（浏览器预览：文件已下载到默认下载目录）' }),
@@ -858,18 +1205,61 @@
         global: Object.keys(GLOBALS).map((k) => ({ key: GLOBALS[k], label: k, hint: '' })),
       }),
     scanTemplate: ({ subject, body }) => ok(scan(`${subject || ''}\n${body || ''}`)),
-    previewTemplate: ({ subject, body, contactId, accountId }) => {
+    previewTemplate: ({ subject, body, contactId, accountId, spinIndex }) => {
       const contact = contacts.find((c) => c.id === contactId) || contacts[0];
       const g = globals(settings, { index: 1, total: 1 });
       const account = resolveAccount(accountId);
+      const subjectSource = String(subject || '');
+      const bodySource = String(body || '');
+      const subjectVariants = spinVariants(subjectSource);
+      const bodyVariants = spinVariants(bodySource);
+      const totalVariants = subjectVariants * bodyVariants;
+      // 与主进程一致：主题变体 × 正文变体统一编号，序号由界面指定（「换一组措辞」）
+      const composite = spinIndex == null ? Math.floor(Math.random() * totalVariants) % totalVariants : Number(spinIndex);
+      const subjectIndex = Math.floor(composite / bodyVariants) % subjectVariants;
+      const bodyIndex = composite % bodyVariants;
+      const s = render(subjectSource, contact, g, subjectIndex);
+      const b = render(bodySource, contact, g, bodyIndex);
       return ok({
         contact,
         rendered: {
-          subject: render(subject, contact, g).text,
-          body: render(body, contact, g).text,
-          missing: render(`${subject}\n${body}`, contact, g).missing,
+          subject: s.text,
+          body: b.text,
+          missing: Array.from(new Set([...s.missing, ...b.missing])),
+          spintax: { subjectVariants, bodyVariants, totalVariants, subjectIndex, bodyIndex },
         },
         account,
+        spintax: { hasSpintax: totalVariants > 1, subjectVariants, bodyVariants, totalVariants, subjectGroups: [], bodyGroups: [] },
+      });
+    },
+
+    /** Spintax 概览：可产生多少种不同内容 + 随机抽样 */
+    spintaxInfo: ({ subject, body }) => {
+      const subjectSource = String(subject || '');
+      const bodySource = String(body || '');
+      const subjectVariants = spinVariants(subjectSource);
+      const bodyVariants = spinVariants(bodySource);
+      const totalVariants = subjectVariants * bodyVariants;
+      const demoContact = { company: '示例公司', contact: '张三', salutation: '张总', city: '深圳' };
+      const samples = [];
+      for (let i = 0; i < 5; i += 1) {
+        const composite = Math.floor(Math.random() * totalVariants) % totalVariants;
+        const g = globals(settings, { index: i + 1, total: 5 });
+        samples.push({
+          subject: render(subjectSource, demoContact, g, Math.floor(composite / bodyVariants) % subjectVariants).text,
+          body: render(bodySource, demoContact, g, composite % bodyVariants).text.slice(0, 120),
+        });
+      }
+      return ok({
+        hasSpintax: totalVariants > 1,
+        subjectVariants,
+        bodyVariants,
+        totalVariants,
+        subjectGroups: [],
+        bodyGroups: [],
+        samples,
+        sampleCount: samples.length,
+        sampleUniqueSubjects: new Set(samples.map((x) => x.subject)).size,
       });
     },
 
@@ -877,9 +1267,12 @@
       ok(
         campaigns.map((c) => {
           const a = resolveAccount(c.accountId);
+          const poolAccounts = (c.accountIds || []).map((id) => accounts.find((x) => x.id === id)).filter(Boolean);
           return Object.assign({}, c, {
             accountEmail: a ? a.email : '',
             accountName: a ? a.name : '',
+            poolEmails: poolAccounts.map((x) => x.email),
+            paceText: describePace(c.throttle && Object.keys(c.throttle).length ? c.throttle : settings.defaultThrottle),
             scheduleText: describe(c.schedule),
             nextRunText: fmtDT(c.nextRunAt),
             effectiveDryRun: settings.sendMode !== 'live' || c.dryRun !== false,
@@ -935,6 +1328,124 @@
         cursor = new Date(n.getTime() + 1000);
       }
       return ok(out);
+    },
+
+    /** 节奏 / 账号池元信息 */
+    pacingMeta: () => ok({ presets: PACING_PRESETS, strategies: ACCOUNT_STRATEGIES }),
+
+    /** 按当前节奏估算整批耗时 */
+    paceEstimate: ({ throttle, total }) => {
+      const pace = normPace(throttle || {});
+      const count = Math.max(0, Math.round(Number(total) || 0));
+      const ms = estimatePaceMs(pace, count);
+      return ok({ pace, total: count, ms, text: humanizeMs(ms), describe: describePace(pace) });
+    },
+
+    // ---------------- 退信监听（IMAP） ----------------
+    bounceState: () => {
+      const list = accounts.map((a) => {
+        const imap = a.imap || {};
+        const readiness = !imap.enabled
+          ? '未启用 IMAP 退信监听'
+          : !imap.host
+            ? '未配置 IMAP 服务器地址'
+            : !(imap.user || a.user || a.email)
+              ? '未配置 IMAP 登录名'
+              : !(imap.pass || a.pass)
+                ? 'IMAP 密码与发信密码都为空，无法登录（两者至少填一个）'
+                : null;
+        return {
+          id: a.id,
+          name: a.name,
+          email: a.email,
+          enabled: imap.enabled === true,
+          host: imap.host || '',
+          mailbox: imap.mailbox || 'INBOX',
+          readiness,
+          lastCheckAt: imap.lastCheckAt || null,
+          lastError: imap.lastError || '',
+          lastFound: imap.lastFound || 0,
+        };
+      });
+      const enabledCount = list.filter((a) => a.enabled && !a.readiness).length;
+      return ok({
+        running: false,
+        lastCheckAt: settings.imapLastCheckAt || null,
+        lastSummary: lastImapSummary,
+        lastErrors: [],
+        pollMinutes: settings.imapPollMinutes || 5,
+        autoCheck: settings.imapAutoCheck !== false,
+        autoMarkBounce: settings.imapAutoMarkBounce !== false,
+        minType: settings.imapBounceType === 'all' ? 'all' : 'hard',
+        enabledAccountCount: enabledCount,
+        markedCount: contacts.filter((c) => c.bounceMarked).length,
+        eventCount: bounceEvents.length,
+        accounts: list,
+      });
+    },
+
+    checkBounces: () => {
+      const enabled = accounts.filter((a) => a.imap && a.imap.enabled && a.imap.host);
+      const summary = {
+        checkedAt: iso(),
+        reason: 'manual',
+        accounts: enabled.length,
+        scanned: 0,
+        bounced: 0,
+        marked: 0,
+        skipped: 0,
+        errors: [],
+        details: [],
+      };
+      if (!enabled.length) {
+        summary.message = '没有启用 IMAP 监听且配置完整的发信账号，请在「发信邮箱配置」中打开退信监听';
+        lastImapSummary = summary;
+        return ok(summary);
+      }
+      // 浏览器预览无法真正连接 IMAP：只刷新「上次检查时间」，不凭空造退信
+      settings.imapLastCheckAt = summary.checkedAt;
+      enabled.forEach((a) => {
+        a.imap.lastCheckAt = summary.checkedAt;
+        a.imap.lastFound = 0;
+        a.imap.lastError = '';
+      });
+      lastImapSummary = summary;
+      push({ type: 'bounce-state' });
+      return ok(summary);
+    },
+
+    listBounces: (q = {}) => {
+      let list = [...bounceEvents];
+      if (q.accountId) list = list.filter((e) => e.accountId === q.accountId);
+      if (q.type && q.type !== 'all') list = list.filter((e) => e.type === q.type);
+      if (q.matched === 'unmatched') list = list.filter((e) => !e.matched);
+      if (q.matched === 'matched') list = list.filter((e) => e.matched);
+      const kw = String(q.keyword || '').trim().toLowerCase();
+      if (kw) list = list.filter((e) => [e.email, e.company, e.contactName, e.subject, e.status, e.diagnostic, e.accountEmail].join(' ').toLowerCase().includes(kw));
+      return ok({ total: list.length, items: list.slice(0, q.limit || 200) });
+    },
+
+    /** 解除某个联系人的退信标记（与 contacts:releaseBounce 等价，退信页使用） */
+    releaseBounce: ({ id }) => {
+      const c = contacts.find((x) => x.id === id);
+      if (!c) return Promise.resolve({ ok: false, error: '联系人不存在' });
+      return window.api.releaseContactBounce({ id });
+    },
+
+    testImap: ({ id, draft }) => {
+      const acc = id ? accounts.find((a) => a.id === id) : null;
+      const imap = (draft && draft.imap) || (acc && acc.imap) || {};
+      const email = (draft && draft.email) || (acc && acc.email) || '';
+      const smtpPass = (draft && draft.pass) || (acc && acc.pass) || '';
+      if (!imap.enabled) return ok({ ok: false, message: '请先勾选「启用 IMAP 退信监听」', durationMs: 5 });
+      if (!imap.host) return ok({ ok: false, message: '请先填写 IMAP 服务器地址', durationMs: 5 });
+      if (!(imap.user || email)) return ok({ ok: false, message: '未配置 IMAP 登录名', durationMs: 5 });
+      if (!(imap.pass || smtpPass)) return ok({ ok: false, message: 'IMAP 密码与发信密码都为空，无法登录（两者至少填一个）', durationMs: 5 });
+      return ok({
+        ok: true,
+        message: `（浏览器预览为模拟结果）IMAP 连接成功 · ${imap.host}:${imap.port || 993} · 邮箱 ${imap.mailbox || 'INBOX'}（当前 128 封）`,
+        durationMs: 63,
+      });
     },
 
     listLogs: (q = {}) => {

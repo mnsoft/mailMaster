@@ -1254,3 +1254,61 @@ th.num {
     opacity: 0.25;
   }
 }
+
+/* ---------------- 发送节奏 / Spintax / 退信监听（1.0.2 新增） ---------------- */
+
+/* 通用小号提示文字（原先仅在 .panel-title 内生效，现在面板头部任意位置都可用） */
+.hint {
+  font-weight: 400;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+/* 行内状态说明条：用于「节奏估算」「Spintax 变体统计」等即时反馈 */
+.stat-inline {
+  margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--text-faint);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--text-dim);
+}
+.stat-inline.ok {
+  border-left-color: var(--success);
+  background: var(--success-soft);
+}
+.stat-inline.warn {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+}
+.stat-inline b {
+  color: var(--text);
+}
+
+/* Spintax 随机抽样卡片 */
+.spin-sample {
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: 12px;
+  line-height: 1.7;
+  margin-bottom: 6px;
+}
+.spin-sample:last-child {
+  margin-bottom: 0;
+}
+.spin-sample .sub {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  margin-top: 3px;
+  white-space: pre-wrap;
+}
+
+/* 账号池勾选行的日限额说明更紧凑 */
+.checkbox-list label input[type='checkbox'] {
+  flex: 0 0 auto;
+}

@@ -48,6 +48,7 @@ const api = {
   templateFields: () => invoke('templates:fields'),
   scanTemplate: (payload) => invoke('templates:scan', payload),
   previewTemplate: (payload) => invoke('templates:preview', payload),
+  spintaxInfo: (payload) => invoke('templates:spintax', payload),
 
   // 推广任务
   listCampaigns: () => invoke('campaigns:list'),
@@ -58,12 +59,22 @@ const api = {
   pauseCampaign: (payload) => invoke('campaigns:pause', payload),
   cancelCampaign: (id) => invoke('campaigns:cancel', { id }),
   campaignNextRuns: (id) => invoke('campaigns:nextRuns', { id }),
+  pacingMeta: () => invoke('pacing:meta'),
+  paceEstimate: (payload) => invoke('campaigns:paceEstimate', payload),
 
   // 投递状态
   listLogs: (query) => invoke('logs:list', query),
   exportLogsCsv: (query) => invoke('logs:exportCsv', query),
   logMailPreview: (payload) => invoke('logs:mailPreview', payload),
   resendLog: (payload) => invoke('logs:resend', payload),
+
+  // 退信监听（IMAP）
+  bounceState: () => invoke('bounce:state'),
+  checkBounces: (payload) => invoke('bounce:check', payload),
+  listBounces: (query) => invoke('bounce:list', query),
+  releaseBounce: (payload) => invoke('bounce:release', payload),
+  testImap: (payload) => invoke('bounce:test', payload),
+  releaseContactBounce: (payload) => invoke('contacts:releaseBounce', payload),
 
   // 维护
   recomputeStats: () => invoke('maintenance:recomputeStats'),

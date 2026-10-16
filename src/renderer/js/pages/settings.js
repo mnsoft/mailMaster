@@ -6,14 +6,25 @@
     title: '系统设置',
 
     async render(view) {
-      const [infoRes, settings, accountsRes] = await Promise.all([MM.api.info(), MM.loadSettings(true), MM.api.listAccounts()]);
+      const [infoRes, settings, accountsRes, pacingRes] = await Promise.all([
+        MM.api.info(),
+        MM.loadSettings(true),
+        MM.api.listAccounts(),
+        MM.api.pacingMeta(),
+      ]);
+      const presets = (pacingRes && pacingRes.ok && pacingRes.data && pacingRes.data.presets) || [];
       // IPC 统一返回 { ok, data } 信封，先拆开再取值
       const info = (infoRes && infoRes.ok && infoRes.data) || {};
       const s = settings || {};
       const accounts = accountsRes.ok ? accountsRes.data : [];
       const def = accounts.find((a) => a.isDefault) || accounts.find((a) => a.enabled !== false) || accounts[0];
-      const throttle = s.defaultThrottle || { intervalSeconds: 6, dailyLimit: 200, maxRetries: 1 };
+      // 默认发送节奏：补全所有字段，兼容旧数据里只有 intervalSeconds 的写法
+      const throttle = Object.assign(
+        { mode: 'fixed', intervalSeconds: 10, delayMinSeconds: 20, delayMaxSeconds: 90, burstEvery: 0, burstMinSeconds: 180, burstMaxSeconds: 420, hourlyLimit: 0, dailyLimit: 200, maxRetries: 1 },
+        s.defaultThrottle || {},
+      );
       const live = s.sendMode === 'live';
+      const imapAccounts = accounts.filter((a) => a.provider !== 'tencent-ses' && a.imap?.enabled);
 
       view.innerHTML = `
         <div class="page-head">
@@ -82,22 +93,62 @@
           </div>
         </div>
 
-        <div class="grid-2 even">
-          <div class="panel">
-            <div class="panel-head"><div class="panel-title">默认发送节流</div></div>
-            <div class="panel-body">
-              <div class="form-grid">
-                <div class="field"><label class="field-label">每封间隔（秒）</label>
-                  <input class="input" type="number" min="0" data-role="intervalSeconds" value="${MM.attr(throttle.intervalSeconds)}" /></div>
-                <div class="field"><label class="field-label">每日发送上限</label>
-                  <input class="input" type="number" min="0" data-role="dailyLimit" value="${MM.attr(throttle.dailyLimit)}" /></div>
-                <div class="field"><label class="field-label">失败重试次数</label>
-                  <input class="input" type="number" min="0" data-role="maxRetries" value="${MM.attr(throttle.maxRetries)}" /></div>
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">默认发送节奏 <span class="hint">新建推广任务时的默认值，任务内仍可单独调整</span></div>
+            <div class="panel-head-actions">
+              <div class="var-picker" data-role="pace-presets">
+                ${presets.map((p) => `<button class="var-chip" data-preset="${p.key}" title="${MM.attr(p.hint)}">${MM.esc(p.label)}</button>`).join('')}
               </div>
-              <div class="field-hint">新建任务时会以这些值作为默认，仍然可以在任务中单独调整。每个发信账号还可以设置自己的日发送上限。</div>
             </div>
           </div>
+          <div class="panel-body">
+            <div class="field" style="margin-bottom:10px">
+              <label class="field-label">间隔模式</label>
+              <div class="segmented" data-role="pace-mode">
+                <button data-mode="fixed" class="${throttle.mode === 'random' ? '' : 'active'}">固定间隔（可预期）</button>
+                <button data-mode="random" class="${throttle.mode === 'random' ? 'active' : ''}">随机延迟（拟人，推荐）</button>
+              </div>
+              <div class="field-hint">随机延迟让每封邮件之间的等待时间在区间内浮动，避免等间隔的机器特征，降低触发垃圾邮件频率阈值与限流封号的风险。</div>
+            </div>
 
+            <div class="form-grid c3">
+              <div class="field ${throttle.mode === 'random' ? 'hidden' : ''}" data-role="pace-fixed">
+                <label class="field-label">每封间隔（秒）</label>
+                <input class="input" type="number" min="0" data-role="intervalSeconds" value="${MM.attr(throttle.intervalSeconds)}" /></div>
+              <div class="field ${throttle.mode === 'random' ? '' : 'hidden'}" data-role="pace-random-min">
+                <label class="field-label">随机最小延迟（秒）</label>
+                <input class="input" type="number" min="0" data-role="delayMinSeconds" value="${MM.attr(throttle.delayMinSeconds)}" /></div>
+              <div class="field ${throttle.mode === 'random' ? '' : 'hidden'}" data-role="pace-random-max">
+                <label class="field-label">随机最大延迟（秒）</label>
+                <input class="input" type="number" min="0" data-role="delayMaxSeconds" value="${MM.attr(throttle.delayMaxSeconds)}" /></div>
+            </div>
+
+            <div class="form-grid c3" style="margin-top:6px">
+              <div class="field"><label class="field-label">每多少封后长停顿（0 = 不启用）</label>
+                <input class="input" type="number" min="0" data-role="burstEvery" value="${MM.attr(throttle.burstEvery)}" /></div>
+              <div class="field"><label class="field-label">长停顿最短（秒）</label>
+                <input class="input" type="number" min="0" data-role="burstMinSeconds" value="${MM.attr(throttle.burstMinSeconds)}" /></div>
+              <div class="field"><label class="field-label">长停顿最长（秒）</label>
+                <input class="input" type="number" min="0" data-role="burstMaxSeconds" value="${MM.attr(throttle.burstMaxSeconds)}" /></div>
+            </div>
+
+            <div class="form-grid c3" style="margin-top:6px">
+              <div class="field"><label class="field-label">每小时发送上限（0 = 不限）</label>
+                <input class="input" type="number" min="0" data-role="hourlyLimit" value="${MM.attr(throttle.hourlyLimit)}" />
+                <div class="field-hint">超过后自动等待到下一个小时窗口继续</div></div>
+              <div class="field"><label class="field-label">每日发送上限（0 = 不限）</label>
+                <input class="input" type="number" min="0" data-role="dailyLimit" value="${MM.attr(throttle.dailyLimit)}" /></div>
+              <div class="field"><label class="field-label">失败重试次数</label>
+                <input class="input" type="number" min="0" max="5" data-role="maxRetries" value="${MM.attr(throttle.maxRetries)}" /></div>
+            </div>
+
+            <div class="stat-inline" data-role="pace-preview">—</div>
+            <div class="field-hint">每个发信账号还可以设置自己的日发送上限；推广任务页在保存前也会按命中人数估算整批耗时。</div>
+          </div>
+        </div>
+
+        <div class="grid-2 even">
           <div class="panel">
             <div class="panel-head"><div class="panel-title">退信保护</div></div>
             <div class="panel-body">
@@ -108,6 +159,40 @@
                 <label class="field-label">触发阈值（累计退信数）</label>
                 <input class="input" type="number" min="1" data-role="bouncePauseThreshold" value="${MM.attr(s.bouncePauseThreshold || 5)}" />
                 <div class="field-hint">当单次执行中退信数超过阈值且退信率高于 30% 时自动暂停，保护发信信誉。</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div class="panel-title">IMAP 退信监听 <span class="hint">全局开关，账号级配置在「发信邮箱配置」中</span></div>
+              <button class="btn btn-sm" data-act="goto-bounce">查看监听详情</button>
+            </div>
+            <div class="panel-body">
+              <div class="field">
+                <label class="switch"><input type="checkbox" data-role="imapAutoCheck" ${s.imapAutoCheck !== false ? 'checked' : ''} /><span class="track"></span>开启自动轮询检查退信</label>
+                <div class="field-hint">关闭后只在你点击「退信监听」页的「立即检查退信」时扫描。</div>
+              </div>
+              <div class="form-grid">
+                <div class="field"><label class="field-label">轮询间隔（分钟）</label>
+                  <input class="input" type="number" min="1" max="1440" data-role="imapPollMinutes" value="${MM.attr(s.imapPollMinutes || 5)}" /></div>
+                <div class="field"><label class="field-label">自动标记的退信类型</label>
+                  <select class="select" data-role="imapBounceType">
+                    <option value="hard" ${s.imapBounceType !== 'all' ? 'selected' : ''}>仅硬退信 / 被拒收（推荐）</option>
+                    <option value="all" ${s.imapBounceType === 'all' ? 'selected' : ''}>所有退信（含临时退信）</option>
+                  </select></div>
+              </div>
+              <div class="field">
+                <label class="switch"><input type="checkbox" data-role="imapAutoMarkBounce" ${s.imapAutoMarkBounce !== false ? 'checked' : ''} /><span class="track"></span>识别到退信后自动标记地址并从发送列表剔除</label>
+              </div>
+              <div class="callout ${imapAccounts.length ? '' : 'warn'}" style="margin:0">
+                ${
+                  imapAccounts.length
+                    ? `已开启监听的账号：${imapAccounts.map((a) => MM.esc(a.email)).join('、')}。上次检查 ${
+                        s.imapLastCheckAt ? MM.esc(MM.fmtDate(s.imapLastCheckAt, true)) : '尚未执行'
+                      }。`
+                    : '还没有任何账号开启 IMAP 退信监听。请前往「发信邮箱配置」→ 编辑普通邮箱账号 → 打开「退信监听（IMAP）」并填写收信服务器。'
+                }
               </div>
             </div>
           </div>
@@ -171,22 +256,89 @@
         };
       });
 
+      // ----- 默认发送节奏 -----
+      let paceMode = throttle.mode === 'random' ? 'random' : 'fixed';
+      const paceFixedBox = view.querySelector('[data-role="pace-fixed"]');
+      const paceRandomMinBox = view.querySelector('[data-role="pace-random-min"]');
+      const paceRandomMaxBox = view.querySelector('[data-role="pace-random-max"]');
+
+      const collectThrottle = () => ({
+        mode: paceMode,
+        intervalSeconds: Number(view.querySelector('[data-role="intervalSeconds"]').value) || 0,
+        delayMinSeconds: Number(view.querySelector('[data-role="delayMinSeconds"]').value) || 0,
+        delayMaxSeconds: Number(view.querySelector('[data-role="delayMaxSeconds"]').value) || 0,
+        burstEvery: Number(view.querySelector('[data-role="burstEvery"]').value) || 0,
+        burstMinSeconds: Number(view.querySelector('[data-role="burstMinSeconds"]').value) || 0,
+        burstMaxSeconds: Number(view.querySelector('[data-role="burstMaxSeconds"]').value) || 0,
+        hourlyLimit: Number(view.querySelector('[data-role="hourlyLimit"]').value) || 0,
+        dailyLimit: Number(view.querySelector('[data-role="dailyLimit"]').value) || 0,
+        maxRetries: Number(view.querySelector('[data-role="maxRetries"]').value) || 0,
+      });
+
+      /** 用主进程的节奏模块生成中文说明，保证界面文案与实际执行逻辑一致 */
+      const refreshPacePreview = async () => {
+        const box = view.querySelector('[data-role="pace-preview"]');
+        if (!box || !box.isConnected) return;
+        const res = await MM.api.paceEstimate({ throttle: collectThrottle(), total: 0 });
+        if (!res.ok || !box.isConnected) return;
+        box.className = 'stat-inline ok';
+        box.innerHTML = `当前默认节奏：<b>${MM.esc(res.data.describe)}</b>`;
+      };
+
+      const paintPaceMode = () => {
+        view.querySelectorAll('[data-role="pace-mode"] button').forEach((b) => b.classList.toggle('active', b.dataset.mode === paceMode));
+        if (paceFixedBox) paceFixedBox.classList.toggle('hidden', paceMode !== 'fixed');
+        if (paceRandomMinBox) paceRandomMinBox.classList.toggle('hidden', paceMode !== 'random');
+        if (paceRandomMaxBox) paceRandomMaxBox.classList.toggle('hidden', paceMode !== 'random');
+      };
+
+      view.querySelectorAll('[data-role="pace-mode"] button').forEach((btn) => {
+        btn.onclick = () => {
+          paceMode = btn.dataset.mode;
+          paintPaceMode();
+          refreshPacePreview();
+        };
+      });
+
+      view.querySelectorAll('[data-role="pace-presets"] [data-preset]').forEach((btn) => {
+        btn.onclick = () => {
+          const preset = presets.find((p) => p.key === btn.dataset.preset);
+          if (!preset) return;
+          paceMode = preset.config.mode === 'random' ? 'random' : 'fixed';
+          paintPaceMode();
+          Object.keys(preset.config).forEach((key) => {
+            const el = view.querySelector(`[data-role="${key}"]`);
+            if (el) el.value = preset.config[key];
+          });
+          refreshPacePreview();
+          MM.toast(`已套用节奏预设「${preset.label}」，记得点击「保存全部设置」`, 'success', 6000);
+        };
+      });
+
+      ['intervalSeconds', 'delayMinSeconds', 'delayMaxSeconds', 'burstEvery', 'burstMinSeconds', 'burstMaxSeconds', 'hourlyLimit', 'dailyLimit', 'maxRetries'].forEach((key) => {
+        const el = view.querySelector(`[data-role="${key}"]`);
+        if (el) el.addEventListener('input', () => refreshPacePreview());
+      });
+      paintPaceMode();
+      refreshPacePreview();
+
       const collect = () => ({
         senderCompany: view.querySelector('[data-role="senderCompany"]').value.trim(),
         sendMode: mode,
-        defaultThrottle: {
-          intervalSeconds: Number(view.querySelector('[data-role="intervalSeconds"]').value) || 0,
-          dailyLimit: Number(view.querySelector('[data-role="dailyLimit"]').value) || 0,
-          maxRetries: Number(view.querySelector('[data-role="maxRetries"]').value) || 0,
-        },
+        defaultThrottle: collectThrottle(),
         bounceAutoPause: view.querySelector('[data-role="bounceAutoPause"]').checked,
         bouncePauseThreshold: Number(view.querySelector('[data-role="bouncePauseThreshold"]').value) || 5,
+        imapAutoCheck: view.querySelector('[data-role="imapAutoCheck"]').checked,
+        imapPollMinutes: Number(view.querySelector('[data-role="imapPollMinutes"]').value) || 5,
+        imapAutoMarkBounce: view.querySelector('[data-role="imapAutoMarkBounce"]').checked,
+        imapBounceType: view.querySelector('[data-role="imapBounceType"]').value,
         appendFooter: view.querySelector('[data-role="appendFooter"]').checked,
         footerText: view.querySelector('[data-role="footerText"]').value,
         logRetentionDays: Number(view.querySelector('[data-role="logRetentionDays"]').value) || 0,
       });
 
       view.querySelector('[data-act="goto-accounts"]').onclick = () => MM.navigate('accounts');
+      view.querySelector('[data-act="goto-bounce"]').onclick = () => MM.navigate('bounce');
 
       view.querySelector('[data-act="save-all"]').onclick = async (e) => {
         const restore = MM.spinBtn(e.target, '保存中');

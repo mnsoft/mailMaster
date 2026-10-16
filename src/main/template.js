@@ -2,11 +2,40 @@
 
 /**
  * 推广内容模板编译引擎
- * 语法：{{变量}}  —— 支持中文标签、英文键名与常见别名，均不区分大小写与首尾空格。
- * 例：尊敬的{{称呼}}{{联系人}}，您好！{{公司名}} —— 我们注意到...
+ *
+ * 语法一：{{变量}}  —— 支持中文标签、英文键名与常见别名，均不区分大小写与首尾空格。
+ *   例：尊敬的{{称呼}}{{联系人}}，您好！{{公司名}} —— 我们注意到...
+ * 语法二：{选项A|选项B}  —— Spintax 同义词轮换，每封邮件随机取一个，使主题与正文字面不同。
+ *   两种语法互不冲突：只有「含顶层 | 的大括号组」才按 Spintax 解析。
  */
 
+const spintax = require('./spintax');
+
 const VAR_PATTERN = /\{\{\s*([^{}\n]{1,40}?)\s*\}\}/g;
+
+/**
+ * 变量保护寄存器：Spintax 展开前先把 {{变量}} 抽成占位符，
+ * 否则 `{{公司名}}` 里层的大括号会被误判成一个选项组。
+ */
+const GUARD_OPEN = '\u0001';
+const GUARD_CLOSE = '\u0002';
+const GUARD_PATTERN = new RegExp(`${GUARD_OPEN}(\\d+)${GUARD_CLOSE}`, 'g');
+
+function protectVariables(source) {
+  const store = [];
+  const text = String(source == null ? '' : source).replace(VAR_PATTERN, (full) => {
+    store.push(full);
+    return `${GUARD_OPEN}${store.length - 1}${GUARD_CLOSE}`;
+  });
+  return { text, store };
+}
+
+function restoreVariables(text, store) {
+  return String(text).replace(GUARD_PATTERN, (matched, index) => {
+    const hit = store[Number(index)];
+    return hit == null ? matched : hit;
+  });
+}
 
 /** 联系人可用字段（同时也是 CSV 导入列名） */
 const CONTACT_FIELDS = [
@@ -100,11 +129,11 @@ function buildGlobalContext(extra = {}) {
 }
 
 /**
- * 渲染模板：把 {{变量}} 替换成收件人对应的真实内容
+ * 渲染模板：先展开 Spintax 选出本封邮件使用的措辞，再把 {{变量}} 替换成收件人对应的真实内容
  * @param {string} text 模板文本
  * @param {object} contact 联系人记录
- * @param {object} options { globals, fallback, strict }
- * @returns {{ text: string, resolved: string[], missing: string[] }}
+ * @param {object} options { globals, fallback, strict, spintax: { used, rng, seed } }
+ * @returns {{ text: string, resolved: string[], missing: string[], variants: number, signature: string }}
  */
 function render(text, contact = {}, options = {}) {
   const globals = options.globals || buildGlobalContext();
@@ -112,7 +141,14 @@ function render(text, contact = {}, options = {}) {
   const resolved = [];
   const missing = [];
 
-  const out = String(text == null ? '' : text).replace(VAR_PATTERN, (full, raw) => {
+  const source = String(text == null ? '' : text);
+  // 1) 保护 {{变量}}，避免被 Spintax 解析器当成选项组
+  const guard = protectVariables(source);
+  // 2) 展开 Spintax（每封邮件独立随机，优先选用本批次尚未用过的组合）
+  const spun = spintax.expand(guard.text, options.spintax);
+  const working = restoreVariables(spun.text, guard.store);
+  // 3) 变量替换
+  const out = working.replace(VAR_PATTERN, (full, raw) => {
     const rawName = String(raw).trim();
     const key = resolveVarName(rawName);
     if (!key) {
@@ -138,17 +174,53 @@ function render(text, contact = {}, options = {}) {
     text: out,
     resolved: Array.from(new Set(resolved)),
     missing: Array.from(new Set(missing)),
+    variants: spun.variants,
+    index: spun.index,
   };
 }
 
-/** 批量渲染主题 + 正文，返回缺失变量概览 */
-function renderMessage(template, contact, globals) {
-  const subject = render(template.subject || '', contact, { globals });
-  const body = render(template.body || '', contact, { globals });
+/**
+ * 批量渲染主题 + 正文，返回缺失变量概览与 Spintax 变体信息
+ *
+ * 去重策略：把「主题变体 × 正文变体」看成一个组合空间统一编号，
+ * 传入 spintax.used 后每次取一个没用过的组合，因此只要组合总数 ≥ 收件人数，
+ * 这一批邮件的主题与正文就不会重复。
+ *
+ * @param {object} template { subject, body }
+ * @param {object} contact
+ * @param {object} globals
+ * @param {object} [options] { spintax: { used: Set<number>, rng, index } }
+ */
+function renderMessage(template, contact, globals, options = {}) {
+  const spin = options.spintax || {};
+  const subjectSource = template.subject || '';
+  const bodySource = template.body || '';
+
+  const subjectVariants = spintax.countVariants(subjectSource);
+  const bodyVariants = spintax.countVariants(bodySource);
+
+  let subjectIndex;
+  let bodyIndex;
+  if (spin.used instanceof Set) {
+    const composite = spintax.pickIndex(subjectVariants * bodyVariants, spin.used, spin.rng);
+    subjectIndex = Math.floor(composite / bodyVariants);
+    bodyIndex = composite % bodyVariants;
+  } else if (spin.index != null) {
+    const composite = Number(spin.index) || 0;
+    subjectIndex = Math.floor(composite / bodyVariants);
+    bodyIndex = composite % bodyVariants;
+  }
+
+  const subject = render(subjectSource, contact, {
+    globals,
+    spintax: { index: subjectIndex, rng: spin.rng },
+  });
+  const body = render(bodySource, contact, { globals, spintax: { index: bodyIndex, rng: spin.rng } });
+
   const variables = Array.from(
     new Set([
-      ...listVariables(template.subject || '').map((v) => v.raw),
-      ...listVariables(template.body || '').map((v) => v.raw),
+      ...listVariables(subjectSource).map((v) => v.raw),
+      ...listVariables(bodySource).map((v) => v.raw),
     ]),
   );
   const missing = Array.from(new Set([...subject.missing, ...body.missing]));
@@ -158,6 +230,27 @@ function renderMessage(template, contact, globals) {
     variables,
     missing,
     missingText: missing.length ? `模板变量缺失：${missing.join('、')}` : '',
+    spintax: {
+      subjectVariants,
+      bodyVariants,
+      totalVariants: subjectVariants * bodyVariants,
+      subjectIndex: subject.index,
+      bodyIndex: body.index,
+    },
+  };
+}
+
+/** 模板的 Spintax 概览（供界面提示可产生多少种不同内容） */
+function describeSpintax(template) {
+  const subject = spintax.describe((template && template.subject) || '');
+  const body = spintax.describe((template && template.body) || '');
+  return {
+    hasSpintax: subject.hasSpintax || body.hasSpintax,
+    subjectVariants: subject.variants,
+    bodyVariants: body.variants,
+    totalVariants: subject.variants * body.variants,
+    subjectGroups: subject.groups,
+    bodyGroups: body.groups,
   };
 }
 
@@ -169,6 +262,8 @@ module.exports = {
   listVariables,
   render,
   renderMessage,
+  describeSpintax,
   buildGlobalContext,
   resolveVarName,
+  spintax,
 };
